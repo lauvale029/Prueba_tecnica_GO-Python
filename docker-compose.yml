@@ -1,0 +1,48 @@
+services:
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    env_file:
+      - .env
+    ports:
+      - "${PORT:-8080}:8080"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_started
+    networks:
+      - mova
+
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: ${DB_USER:-mova}
+      POSTGRES_PASSWORD: ${DB_PASSWORD:-mova}
+      POSTGRES_DB: ${DB_NAME:-mova_payments}
+    ports:
+      - "${DB_PORT:-5432}:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${DB_USER:-mova} -d ${DB_NAME:-mova_payments}"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    networks:
+      - mova
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    networks:
+      - mova
+
+volumes:
+  postgres_data:
+
+networks:
+  mova:
+    driver: bridge
