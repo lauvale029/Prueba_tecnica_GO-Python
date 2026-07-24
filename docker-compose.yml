@@ -45,4 +45,5 @@ volumes:
 
 networks:
   mova:
+    name: mova
     driver: bridge

@@ -91,13 +91,44 @@ servidor HTTP esté implementado.)_
 
 ## Migraciones
 
-_(Pendiente — se documenta en la fase de dominio y migraciones: herramienta
-usada, cómo aplicarlas y cómo revertirlas.)_
+Las migraciones son archivos SQL versionados en `migrations/`, con un par
+`.up.sql`/`.down.sql` por cada paso (`0001_init_schema.up.sql` crea el
+esquema inicial: `merchants`, `payments`, `payment_status_history`; su
+`.down.sql` lo revierte). Se aplican con
+[`golang-migrate`](https://github.com/golang-migrate/migrate) a través de su
+imagen Docker oficial, sin necesidad de instalar nada localmente.
+
+Con Postgres ya levantado (`docker compose up -d postgres`) y tu `.env`
+completo:
+
+```bash
+scripts/migrate.sh up          # aplica todas las migraciones pendientes
+scripts/migrate.sh down 1      # revierte la última migración aplicada
+scripts/migrate.sh version     # muestra la versión actual del esquema
+```
+
+El script conecta el contenedor de `migrate` a la misma red Docker
+(`mova`) que usa `docker-compose.yml`, y arma la cadena de conexión interna
+usando `postgres` (el nombre del servicio) como host — no `localhost`, que
+solo es válido para herramientas que corren directamente en tu máquina.
 
 ## Pruebas
 
-_(Pendiente — se documenta a medida que se agreguen los paquetes de pruebas
-por fase: dominio, repositorios, endpoints, worker de Python.)_
+```bash
+go test ./... -v
+```
+
+Por ahora cubre `internal/domain` (18 tests): creación válida de
+`Merchant`/`Payment`, cada validación individual fallando (nombre vacío,
+email inválido, monto ≤ 0, moneda no soportada, método de pago inválido,
+referencia externa/llave de idempotencia faltantes), la tabla completa de
+transiciones de estado válidas e inválidas, y el caso de no poder volver a
+`PENDING` desde un estado terminal. Son pruebas unitarias puras, sin base
+de datos ni HTTP de por medio.
+
+_(Se irán agregando, por fase: pruebas de integración contra Postgres real
+para los repositorios, pruebas de los endpoints HTTP con idempotencia y
+concurrencia, y las del worker de conciliación en Python.)_
 
 ## Decisiones técnicas
 
