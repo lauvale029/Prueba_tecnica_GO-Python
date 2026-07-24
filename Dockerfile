@@ -1,4 +1,4 @@
-# --- Build stage ---
+# --- Etapa de build ---
 FROM golang:1.25-alpine AS build
 WORKDIR /src
 
@@ -8,7 +8,7 @@ RUN go mod download
 COPY . .
 RUN CGO_ENABLED=0 GOOS=linux go build -o /out/api ./cmd/api
 
-# --- Runtime stage ---
+# --- Etapa de ejecución ---
 FROM alpine:3.20
 RUN apk add --no-cache ca-certificates
 WORKDIR /app
