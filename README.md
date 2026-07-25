@@ -126,20 +126,86 @@ transiciones de estado válidas e inválidas, y el caso de no poder volver a
 `PENDING` desde un estado terminal. Son pruebas unitarias puras, sin base
 de datos ni HTTP de por medio.
 
-_(Se irán agregando, por fase: pruebas de integración contra Postgres real
-para los repositorios, pruebas de los endpoints HTTP con idempotencia y
-concurrencia, y las del worker de conciliación en Python.)_
+Los repositorios de Postgres (`internal/infrastructure/postgres`) tienen
+pruebas de integración contra una base real, separadas con el build tag
+`integration` para que no corran en el `go test ./...` normal (no todos los
+entornos tienen Postgres levantado). Para correrlas:
+
+```bash
+docker compose up -d postgres
+scripts/migrate.sh up
+set -a && source .env && set +a
+go test -tags=integration ./internal/infrastructure/postgres/... -v
+```
+
+Cubren: creación y lectura de comercios y pagos, `ErrNotFound` cuando el
+recurso no existe, `ErrConflict` cuando se viola una restricción única
+(`document_number` duplicado, `idempotency_key` duplicada, y
+`merchant_id + external_reference` duplicados), actualización de estado, y
+creación/listado del historial de estados.
+
+_(Se irán agregando, por fase: pruebas de los endpoints HTTP con
+idempotencia y concurrencia, y las del worker de conciliación en Python.)_
 
 ## Decisiones técnicas
 
+- **Arquitectura — puertos y adaptadores (hexagonal):** `internal/domain`
+  no importa nada externo (ni Fiber, ni SQL, ni Redis); `internal/application`
+  define únicamente las interfaces ("puertos") que necesita de la
+  infraestructura (`MerchantRepository`, `PaymentRepository`, etc. en
+  `ports.go`), sin saber si detrás hay Postgres, otra base, o un mock;
+  `internal/infrastructure` (Postgres, Redis) y `internal/transport` (HTTP)
+  son los "adaptadores" que implementan esos puertos o los consumen.
+  - **Testabilidad:** los casos de uso (Fase 3+) se pueden probar contra un
+    repositorio falso en memoria, sin levantar Postgres — las pruebas de
+    reglas de negocio no dependen de infraestructura real.
+  - **Reemplazabilidad:** cambiar de Postgres a otra base de datos, o
+    agregar una capa de cache, solo toca `internal/infrastructure` — el
+    dominio y los casos de uso no se enteran ni cambian.
+  - **Protección del dominio:** las reglas de negocio quedan aisladas de
+    detalles que cambian con el tiempo (versión de Fiber, del driver SQL,
+    etc.), en vez de estar mezcladas con código de framework.
 - **Framework HTTP:** Fiber, por ser el preferido según el anexo de la
   prueba y su bajo overhead sobre `fasthttp`.
-- **Acceso a datos:** `sqlc` + `database/sql` (driver `pgx`). Se prefirió
-  sobre un ORM para mantener control explícito del SQL y generar código
-  type-safe sin reflection en runtime.
-- **Dinero:** columnas `NUMERIC` en PostgreSQL mapeadas a
-  `shopspring/decimal` en Go, evitando por completo el uso de `float64`
-  para valores monetarios.
+- **Acceso a datos — por qué no un ORM:** se usa `sqlc` + `database/sql`
+  (con `pgx` registrado como driver) en vez de un ORM como GORM.
+  - El SQL se escribe a mano en `internal/infrastructure/postgres/queries/*.sql`
+    y `sqlc` genera, a partir de ahí, structs y funciones Go type-safe —
+    sin reflection en runtime y sin que arme queries dinámicamente
+    por debajo. Lo que se ejecuta contra la base es exactamente el SQL que
+    se escribe, verificable leyendo el archivo `.sql`.
+  - Con un ORM es fácil terminar con problemas de rendimiento ocultos
+    (ej. N+1 queries) o SQL generado subóptimo sin darse cuenta, porque el
+    ORM abstrae la query real. Aquí, si una consulta es lenta o compleja,
+    se ve y se optimiza directamente en el `.sql`.
+  - `sqlc` sigue dando *type-safety* en tiempo de compilación (los
+    parámetros y columnas devueltas son structs Go generados, no `map[string]interface{}`
+    ni *interface{}* sueltos), que es la principal ventaja que suele
+    atraer a un ORM — sin pagar el costo de la abstracción extra.
+  - Costo aceptado: hay que escribir cada query a mano y regenerar el
+    código (`scripts/sqlc-generate.sh`) cada vez que cambian; para el
+    tamaño de este proyecto (pocas tablas, queries acotadas) es un costo
+    bajo comparado con el control y la claridad que da.
+  - Nota de configuración: para que `sqlc` mapee columnas `NUMERIC` a
+    `decimal.Decimal` (ver punto de Dinero abajo), el override en
+    `sqlc.yaml` debe usar `db_type: "pg_catalog.numeric"` — el nombre
+    corto `"numeric"` no lo reconoce y la columna queda como `string`.
+- **Dinero — por qué `decimal.Decimal` y no `float64`:** columnas
+  `NUMERIC` en PostgreSQL mapeadas a `shopspring/decimal` en Go.
+  - Los `float64` usan coma flotante binaria (IEEE 754): la mayoría de
+    los valores decimales "normales" (`0.10`, `19.99`, etc.) no tienen
+    representación exacta en binario, igual que 1/3 no la tiene en
+    decimal. Esto produce errores de redondeo reales, por ejemplo
+    `0.1 + 0.2 == 0.30000000000000004` o `19.99 * 3 == 59.97000000000001`
+    en la mayoría de los lenguajes, Go incluido.
+  - Para dinero eso es inaceptable: sumar miles de transacciones con ese
+    error acumulado descuadraría los totales del resumen por comercio
+    frente a lo que realmente se procesó.
+  - `decimal.Decimal` representa el número como un entero exacto más un
+    exponente (`19.99` se guarda como `1999 × 10⁻²`), igual que `NUMERIC`
+    en Postgres — sin paso por binario, sin error de redondeo. El costo
+    (aritmética un poco más lenta que con floats nativos) es irrelevante
+    para el volumen de este sistema.
 - **Autenticación:** JWT.
 - **Redis:** usado como componente para (1) idempotencia
   rápida en la creación de pagos junto a la restricción única en Postgres,
@@ -151,8 +217,37 @@ justificación.)_
 
 ## Supuestos
 
-_(Pendiente — se documentan conforme surjan durante la implementación.)_
+El enunciado no detalla todo el comportamiento posible; donde tuvimos que
+decidir, asumimos:
+
+1. **Moneda única:** solo `COP` es válido hoy (`domain.SupportedCurrency`).
+   Agregar otra moneda requeriría revisar `Money` y probablemente manejar
+   tasas de conversión, fuera del alcance de esta prueba.
+2. **Estados de comercio:** el enunciado no define estados para
+   `Merchant`, así que se asumió `ACTIVE`/`INACTIVE`, arrancando siempre
+   en `ACTIVE`.
+3. **La llave de idempotencia la genera el cliente**, no la API — el
+   servidor solo la valida y la usa para detectar reintentos.
+4. **IDs:** UUID v4 en formato string para todas las entidades.
+5. **Precisión monetaria:** `NUMERIC(18,2)` — hasta 2 decimales, aunque el
+   ejemplo del enunciado usa montos enteros (`150000`).
+6. **`document_number` es único globalmente** entre comercios (el
+   enunciado no lo dice explícitamente, pero es la interpretación de
+   negocio más razonable para un identificador fiscal).
 
 ## Limitaciones
 
-_(Pendiente.)_
+- **Puerto de Postgres configurable por conflictos locales:** si en tu
+  máquina ya corre un PostgreSQL nativo (ej. un servicio de Windows)
+  escuchando en `5432`, el contenedor de este proyecto no podrá publicar
+  ahí y las conexiones desde el host a `localhost:5432` llegarán al
+  Postgres nativo en vez de al contenedor (fallando la autenticación con
+  usuarios que solo existen en el contenedor). Solución: cambiar
+  `DB_PORT` en tu `.env` a un puerto libre (ej. `5433`) y actualizar
+  `DATABASE_URL` acorde — no requiere tocar código ni `docker-compose.yml`,
+  ambos ya usan `DB_PORT` como variable. Esto solo afecta conexiones desde
+  el host (tests de integración, clientes SQL); las conexiones entre
+  contenedores (`scripts/migrate.sh`, la API corriendo en Docker) siempre
+  usan el puerto interno `5432` y no se ven afectadas.
+- _(Se irán agregando más limitaciones conforme surjan en fases
+  posteriores.)_
