@@ -162,3 +162,76 @@ func TestPaymentRepository_UpdateStatus(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, domain.PaymentStatusApproved, found.Status)
 }
+func TestPaymentRepository_ListAndCount_FilterByMerchant(t *testing.T) {
+	db := testDB(t)
+	merchantA := createTestMerchant(t, db)
+	merchantB := createTestMerchant(t, db)
+	repo := postgres.NewPaymentRepository(db)
+	ctx := context.Background()
+
+	require.NoError(t, repo.Create(ctx, newTestPayment(t, merchantA.ID, "key-"+uuid.New().String())))
+	require.NoError(t, repo.Create(ctx, newTestPayment(t, merchantB.ID, "key-"+uuid.New().String())))
+
+	filter := application.PaymentFilter{MerchantID: &merchantA.ID, Page: 1, Limit: 10}
+
+	results, err := repo.List(ctx, filter)
+	require.NoError(t, err)
+	require.Len(t, results, 1)
+	require.Equal(t, merchantA.ID, results[0].MerchantID)
+
+	total, err := repo.Count(ctx, filter)
+	require.NoError(t, err)
+	require.Equal(t, int64(1), total)
+}
+
+func TestPaymentRepository_ListAndCount_FilterByStatus(t *testing.T) {
+	db := testDB(t)
+	merchant := createTestMerchant(t, db)
+	repo := postgres.NewPaymentRepository(db)
+	ctx := context.Background()
+
+	pending := newTestPayment(t, merchant.ID, "key-"+uuid.New().String())
+	require.NoError(t, repo.Create(ctx, pending))
+
+	approved := newTestPayment(t, merchant.ID, "key-"+uuid.New().String())
+	require.NoError(t, repo.Create(ctx, approved))
+	require.NoError(t, approved.ChangeStatus(domain.PaymentStatusApproved))
+	require.NoError(t, repo.UpdateStatus(ctx, approved))
+
+	status := domain.PaymentStatusApproved
+	filter := application.PaymentFilter{MerchantID: &merchant.ID, Status: &status, Page: 1, Limit: 10}
+
+	results, err := repo.List(ctx, filter)
+	require.NoError(t, err)
+	require.Len(t, results, 1)
+	require.Equal(t, approved.ID, results[0].ID)
+
+	total, err := repo.Count(ctx, filter)
+	require.NoError(t, err)
+	require.Equal(t, int64(1), total)
+}
+
+func TestPaymentRepository_List_Pagination(t *testing.T) {
+	db := testDB(t)
+	merchant := createTestMerchant(t, db)
+	repo := postgres.NewPaymentRepository(db)
+	ctx := context.Background()
+
+	for i := 0; i < 3; i++ {
+		require.NoError(t, repo.Create(ctx, newTestPayment(t, merchant.ID, "key-"+uuid.New().String())))
+	}
+
+	filter := application.PaymentFilter{MerchantID: &merchant.ID, Page: 1, Limit: 2}
+	firstPage, err := repo.List(ctx, filter)
+	require.NoError(t, err)
+	require.Len(t, firstPage, 2)
+
+	filter.Page = 2
+	secondPage, err := repo.List(ctx, filter)
+	require.NoError(t, err)
+	require.Len(t, secondPage, 1)
+
+	total, err := repo.Count(ctx, application.PaymentFilter{MerchantID: &merchant.ID})
+	require.NoError(t, err)
+	require.Equal(t, int64(3), total)
+}

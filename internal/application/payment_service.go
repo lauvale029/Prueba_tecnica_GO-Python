@@ -15,6 +15,15 @@ import (
 // Idempotency-Key ya terminó de crear el pago.
 const idempotencyRetryDelay = 50 * time.Millisecond
 
+// Valores de paginación por defecto y máximo. Exportados porque
+// transport/http los usa para normalizar los query params antes de
+// construir el PaymentFilter.
+const (
+	DefaultPage  = 1
+	DefaultLimit = 100
+	MaxLimit     = 100
+)
+
 // PaymentService orquesta el caso de uso de pagos: valida con el
 // dominio, verifica que el comercio exista, y aplica la estrategia de
 // idempotencia/concurrencia (ver README, sección "Idempotencia y
@@ -22,11 +31,12 @@ const idempotencyRetryDelay = 50 * time.Millisecond
 type PaymentService struct {
 	payments  PaymentRepository
 	merchants MerchantRepository
+	history   PaymentStatusHistoryRepository
 	locker    IdempotencyLocker
 }
 
-func NewPaymentService(payments PaymentRepository, merchants MerchantRepository, locker IdempotencyLocker) *PaymentService {
-	return &PaymentService{payments: payments, merchants: merchants, locker: locker}
+func NewPaymentService(payments PaymentRepository, merchants MerchantRepository, history PaymentStatusHistoryRepository, locker IdempotencyLocker) *PaymentService {
+	return &PaymentService{payments: payments, merchants: merchants, history: history, locker: locker}
 }
 
 // Create crea un pago nuevo, o devuelve el pago ya existente si
@@ -99,4 +109,74 @@ func (s *PaymentService) Create(
 	}
 
 	return payment, nil
+}
+
+// Get consulta un pago existente por su ID.
+func (s *PaymentService) Get(ctx context.Context, id string) (*domain.Payment, error) {
+	return s.payments.GetByID(ctx, id)
+}
+
+// List devuelve los pagos que cumplen filter, junto con el total de
+// coincidencias (sin paginar), para que el llamador pueda calcular
+// cuántas páginas hay. Normaliza Page/Limit a valores seguros antes de
+// consultar: sin esto, "sin parámetros" terminaría trayendo toda la
+// tabla de una sola vez.
+func (s *PaymentService) List(ctx context.Context, filter PaymentFilter) ([]*domain.Payment, int64, error) {
+	if filter.Page < 1 {
+		filter.Page = DefaultPage
+	}
+	if filter.Limit <= 0 {
+		filter.Limit = DefaultLimit
+	}
+	if filter.Limit > MaxLimit {
+		filter.Limit = MaxLimit
+	}
+
+	payments, err := s.payments.List(ctx, filter)
+	if err != nil {
+		return nil, 0, err
+	}
+
+	total, err := s.payments.Count(ctx, filter)
+	if err != nil {
+		return nil, 0, err
+	}
+
+	return payments, total, nil
+}
+
+// UpdateStatus aplica una transición de estado (domain.Payment.ChangeStatus
+// decide si es válida) y deja el registro correspondiente en el
+// historial.
+func (s *PaymentService) UpdateStatus(ctx context.Context, paymentID string, newStatus domain.PaymentStatus, reason, changedBy string) (*domain.Payment, error) {
+	payment, err := s.payments.GetByID(ctx, paymentID)
+	if err != nil {
+		return nil, err
+	}
+
+	previousStatus := payment.Status
+	if err := payment.ChangeStatus(newStatus); err != nil {
+		return nil, err
+	}
+
+	if err := s.payments.UpdateStatus(ctx, payment); err != nil {
+		return nil, err
+	}
+
+	history := domain.NewPaymentStatusHistory(payment.ID, previousStatus, payment.Status, reason, changedBy)
+	if err := s.history.Create(ctx, history); err != nil {
+		return nil, err
+	}
+
+	return payment, nil
+}
+
+// History devuelve el historial de cambios de estado de un pago,
+// verificando primero que el pago exista (para poder responder 404 en
+// vez de una lista vacía silenciosa si el ID no existe).
+func (s *PaymentService) History(ctx context.Context, paymentID string) ([]*domain.PaymentStatusHistory, error) {
+	if _, err := s.payments.GetByID(ctx, paymentID); err != nil {
+		return nil, err
+	}
+	return s.history.ListByPaymentID(ctx, paymentID)
 }

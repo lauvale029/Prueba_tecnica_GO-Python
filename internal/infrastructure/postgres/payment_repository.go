@@ -3,6 +3,9 @@ package postgres
 import (
 	"context"
 	"database/sql"
+	"time"
+
+	"github.com/google/uuid"
 
 	"github.com/lauvale029/Prueba_tecnica_GO-Python/internal/application"
 	"github.com/lauvale029/Prueba_tecnica_GO-Python/internal/domain"
@@ -71,6 +74,86 @@ func (r *PaymentRepository) UpdateStatus(ctx context.Context, payment *domain.Pa
 		UpdatedAt: payment.UpdatedAt,
 	})
 	return mapError(err)
+}
+
+func (r *PaymentRepository) List(ctx context.Context, filter application.PaymentFilter) ([]*domain.Payment, error) {
+	merchantID, err := nullableUUID(filter.MerchantID)
+	if err != nil {
+		return nil, err
+	}
+
+	rows, err := r.queries.ListPayments(ctx, sqlcgen.ListPaymentsParams{
+		MerchantID:    merchantID,
+		Status:        nullableStatus(filter.Status),
+		PaymentMethod: nullablePaymentMethod(filter.PaymentMethod),
+		DateFrom:      nullableTime(filter.DateFrom),
+		DateTo:        nullableTime(filter.DateTo),
+		PageLimit:     int32(filter.Limit),
+		PageOffset:    int32((filter.Page - 1) * filter.Limit),
+	})
+	if err != nil {
+		return nil, mapError(err)
+	}
+
+	payments := make([]*domain.Payment, 0, len(rows))
+	for _, row := range rows {
+		payments = append(payments, toDomainPayment(row))
+	}
+	return payments, nil
+}
+
+func (r *PaymentRepository) Count(ctx context.Context, filter application.PaymentFilter) (int64, error) {
+	merchantID, err := nullableUUID(filter.MerchantID)
+	if err != nil {
+		return 0, err
+	}
+
+	count, err := r.queries.CountPayments(ctx, sqlcgen.CountPaymentsParams{
+		MerchantID:    merchantID,
+		Status:        nullableStatus(filter.Status),
+		PaymentMethod: nullablePaymentMethod(filter.PaymentMethod),
+		DateFrom:      nullableTime(filter.DateFrom),
+		DateTo:        nullableTime(filter.DateTo),
+	})
+	if err != nil {
+		return 0, mapError(err)
+	}
+	return count, nil
+}
+
+// nullableUUID convierte un *string opcional a uuid.NullUUID, el tipo que
+// sqlc genera para un parámetro de tipo uuid que puede ser NULL (ver
+// ListPaymentsParams/CountPaymentsParams en sqlcgen).
+func nullableUUID(id *string) (uuid.NullUUID, error) {
+	if id == nil {
+		return uuid.NullUUID{}, nil
+	}
+	parsed, err := uuid.Parse(*id)
+	if err != nil {
+		return uuid.NullUUID{}, err
+	}
+	return uuid.NullUUID{UUID: parsed, Valid: true}, nil
+}
+
+func nullableStatus(status *domain.PaymentStatus) sql.NullString {
+	if status == nil {
+		return sql.NullString{}
+	}
+	return sql.NullString{String: string(*status), Valid: true}
+}
+
+func nullablePaymentMethod(method *domain.PaymentMethod) sql.NullString {
+	if method == nil {
+		return sql.NullString{}
+	}
+	return sql.NullString{String: string(*method), Valid: true}
+}
+
+func nullableTime(t *time.Time) sql.NullTime {
+	if t == nil {
+		return sql.NullTime{}
+	}
+	return sql.NullTime{Time: *t, Valid: true}
 }
 
 // toDomainPayment reconstruye un domain.Payment a partir de una fila ya

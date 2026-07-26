@@ -147,23 +147,26 @@ go test -tags=integration ./internal/infrastructure/postgres/... -v
 Cubren: creación y lectura de comercios y pagos, `ErrNotFound` cuando el
 recurso no existe, `ErrConflict` cuando se viola una restricción única
 (`document_number` duplicado, `idempotency_key` duplicada, y
-`merchant_id + external_reference` duplicados), actualización de estado, y
-creación/listado del historial de estados.
+`merchant_id + external_reference` duplicados), actualización de estado,
+creación/listado del historial de estados, **listado con filtros y
+paginación** (por comercio, por estado, con `page`/`limit`), y la
+concurrencia real de 20 goroutines contra Postgres con la misma
+`Idempotency-Key`.
 
-`internal/application` (11 tests) prueba `MerchantService` y
+`internal/application` (17 tests) prueba `MerchantService` y
 `PaymentService` con repositorios falsos en memoria: que el dominio
 valide antes de persistir, que los errores se propaguen o se resuelvan
-según corresponda, y (el más importante) que 20 goroutines concurrentes
+según corresponda, transición de estado válida/inválida con su registro
+en el historial, y (el más importante) que 20 goroutines concurrentes
 con la misma `Idempotency-Key` converjan en un solo pago — ver la
 sección "Idempotencia y concurrencia" más abajo. `internal/transport/http`
-(13 tests) prueba los endpoints `POST`/`GET /api/v1/merchants` y
-`POST /api/v1/payments` completos con `app.Test(...)` de Fiber
-(request/response JSON reales, sin red), cubriendo los distintos códigos
-HTTP posibles (`201`, `200`, `404`, `409`, `422`, `400`). Ninguno de los
-dos necesita Postgres.
+(23 tests) prueba **todos** los endpoints de comercios y pagos
+(`POST`/`GET`/`PATCH .../status`/`GET .../history`) completos con
+`app.Test(...)` de Fiber (request/response JSON reales, sin red),
+cubriendo los distintos códigos HTTP posibles (`201`, `200`, `404`,
+`409`, `422`, `400`). Ninguno de los dos necesita Postgres.
 
-_(Se irán agregando, por fase: consulta/listado/transición de estado de
-pagos, y las pruebas del worker de conciliación en Python.)_
+_(Se irá agregando la prueba del worker de conciliación en Python.)_
 
 ## Idempotencia y concurrencia
 
@@ -227,6 +230,28 @@ sin un solo fallo, para descartar que fuera casualidad.
 
 ## Decisiones técnicas
 
+- **Paginación con límite por defecto, nunca "todo" por defecto:**
+  `GET /payments` sin `page`/`limit` no devuelve toda la tabla — usa
+  `page=1, limit=100` (`application.DefaultPage`/`DefaultLimit`), y
+  `limit` nunca puede superar `application.MaxLimit` (100), aunque se
+  pida explícitamente. La razón: si "sin parámetros" significara "sin
+  límite", un olvido del cliente (o un bug) podría traer miles de filas
+  de una sola vez; el comportamiento por defecto de una API debe ser el
+  seguro, no el más costoso. Quien necesite explorar más allá del límite
+  usa `page` para paginar.
+- **`changed_by` es un placeholder hasta la Fase 7:** `PATCH .../status`
+  registra en el historial quién hizo el cambio, pero como la
+  autenticación (JWT) todavía no existe, `transport/http` usa una función
+  `changedBy(c)` que hoy siempre devuelve `"system"` — está aislada en un
+  solo lugar a propósito, para reemplazarla por el subject del token sin
+  tocar `PaymentService` ni el resto del flujo.
+- **Código de error `INVALID_PAYMENT_STATUS` para transición inválida:**
+  se usa ese código exacto (no uno inventado) porque es literalmente el
+  ejemplo que trae la sección 6.3 del documento base para este caso,
+  respondido con `409 Conflict` (es un conflicto de estado, no un cuerpo
+  de petición malformado) y el mensaje en español de
+  `domain.ErrInvalidStatusTransition`, consistente con el resto del
+  proyecto.
 - **Arquitectura — puertos y adaptadores (hexagonal):** `internal/domain`
   no importa nada externo (ni Fiber, ni SQL, ni Redis); `internal/application`
   define únicamente las interfaces ("puertos") que necesita de la

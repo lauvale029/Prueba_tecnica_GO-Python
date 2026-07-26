@@ -9,6 +9,7 @@ import (
 )
 
 type Querier interface {
+	CountPayments(ctx context.Context, arg CountPaymentsParams) (int64, error)
 	CreateMerchant(ctx context.Context, arg CreateMerchantParams) (Merchant, error)
 	CreatePayment(ctx context.Context, arg CreatePaymentParams) (Payment, error)
 	CreatePaymentStatusHistory(ctx context.Context, arg CreatePaymentStatusHistoryParams) (PaymentStatusHistory, error)
@@ -17,6 +18,7 @@ type Querier interface {
 	GetPaymentByIdempotencyKey(ctx context.Context, idempotencyKey string) (Payment, error)
 	GetPaymentByMerchantAndExternalReference(ctx context.Context, arg GetPaymentByMerchantAndExternalReferenceParams) (Payment, error)
 	ListPaymentStatusHistoryByPaymentID(ctx context.Context, paymentID string) ([]PaymentStatusHistory, error)
+	ListPayments(ctx context.Context, arg ListPaymentsParams) ([]Payment, error)
 	UpdatePaymentStatus(ctx context.Context, arg UpdatePaymentStatusParams) (Payment, error)
 }
 
