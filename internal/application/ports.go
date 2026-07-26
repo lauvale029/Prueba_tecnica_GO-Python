@@ -7,7 +7,7 @@ import (
 )
 
 // MerchantRepository es el puerto que la capa de aplicación espera de
-// quien persista comercios (hoy Postgres, en internal/infrastructure/postgres).
+// quien persista comercios
 type MerchantRepository interface {
 	Create(ctx context.Context, merchant *domain.Merchant) error
 	GetByID(ctx context.Context, id string) (*domain.Merchant, error)
