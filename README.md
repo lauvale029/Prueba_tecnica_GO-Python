@@ -150,17 +150,80 @@ recurso no existe, `ErrConflict` cuando se viola una restricción única
 `merchant_id + external_reference` duplicados), actualización de estado, y
 creación/listado del historial de estados.
 
-`internal/application` (5 tests) prueba `MerchantService` con un
-repositorio falso en memoria: que el dominio valide antes de persistir
-(el fake nunca recibe el dato si el email es inválido), y que los errores
-del repositorio se propaguen sin modificarse. `internal/transport/http`
-(6 tests) prueba los endpoints `POST`/`GET /api/v1/merchants` completos
-con `app.Test(...)` de Fiber (request/response JSON reales, sin red),
-cubriendo los distintos códigos HTTP posibles (`201`, `200`, `404`,
-`409`, `422`, `400`). Ninguno de los dos necesita Postgres.
+`internal/application` (11 tests) prueba `MerchantService` y
+`PaymentService` con repositorios falsos en memoria: que el dominio
+valide antes de persistir, que los errores se propaguen o se resuelvan
+según corresponda, y (el más importante) que 20 goroutines concurrentes
+con la misma `Idempotency-Key` converjan en un solo pago — ver la
+sección "Idempotencia y concurrencia" más abajo. `internal/transport/http`
+(13 tests) prueba los endpoints `POST`/`GET /api/v1/merchants` y
+`POST /api/v1/payments` completos con `app.Test(...)` de Fiber
+(request/response JSON reales, sin red), cubriendo los distintos códigos
+HTTP posibles (`201`, `200`, `404`, `409`, `422`, `400`). Ninguno de los
+dos necesita Postgres.
 
-_(Se irán agregando, por fase: idempotencia y concurrencia en la creación
-de pagos, y las pruebas del worker de conciliación en Python.)_
+_(Se irán agregando, por fase: consulta/listado/transición de estado de
+pagos, y las pruebas del worker de conciliación en Python.)_
+
+## Idempotencia y concurrencia
+
+Requisito especial del documento base (sección 8): dos solicitudes
+simultáneas con la misma `Idempotency-Key` nunca deben crear dos pagos.
+
+### Estrategia de dos capas
+
+1. **Restricción única en Postgres — la garantía real.**
+   `UNIQUE (idempotency_key)` en `migrations/0001_init_schema.up.sql`.
+   Sin importar qué pase en el resto del sistema (Redis caído, un bug en
+   el código, mala suerte con los tiempos), Postgres físicamente no
+   permite que dos filas compartan `idempotency_key`. Es la única pieza
+   de la que depende la corrección.
+2. **Lock opcional en Redis — una optimización, no una garantía.**
+   `internal/infrastructure/redis/locker.go`. Antes de crear un pago,
+   `PaymentService` intenta tomar un lock corto (`SET NX` + un token
+   único + un script Lua para liberarlo sin pisar el lock de otro
+   proceso). Si lo consigue, sigue directo. Si no, espera un instante
+   corto, vuelve a chequear una sola vez, y sigue de todas formas si aún
+   no hay nada — nunca bloquea indefinidamente. Sin Redis configurado
+   (`REDIS_ADDR` vacío) o si falla, se usa `application.NoopIdempotencyLocker`
+   (nunca "consigue" el lock): el sistema sigue siendo correcto, solo un
+   poco menos eficiente bajo mucha concurrencia.
+
+### El flujo completo (`internal/application/payment_service.go`)
+
+1. Busca si ya existe un pago con esa `Idempotency-Key` → si sí, lo
+   devuelve tal cual (replay).
+2. Verifica que el comercio exista (si no, `404 MERCHANT_NOT_FOUND`).
+3. Intenta el lock de Redis (best-effort, nunca bloqueante).
+4. Valida con el dominio (`domain.NewPayment`) y persiste.
+5. Si Postgres rechaza por conflicto, **distingue el motivo** volviendo a
+   buscar por la `Idempotency-Key`: si aparece, la carrera fue por esa
+   key → se devuelve el pago del ganador, sin error (idempotencia
+   exitosa); si no aparece, el conflicto fue por
+   `merchant_id + external_reference` duplicados → error real
+   (`409 EXTERNAL_REFERENCE_ALREADY_EXISTS`). No todo "conflicto" de
+   Postgres es un reintento legítimo.
+
+### Pruebas
+
+Dos tests de concurrencia, cada uno cubriendo un riesgo distinto:
+
+- `TestPaymentService_Create_Concurrent` (`internal/application`): 20
+  goroutines con la misma key contra un repositorio falso en memoria,
+  usando a propósito `NoopIdempotencyLocker` (el lock de Redis "nunca
+  ayuda"). Prueba que la **lógica de `PaymentService`** converge
+  correctamente incluso en el peor caso — pero no detectaría una
+  regresión en el esquema real de Postgres (el fake "finge" la
+  restricción única con un mutex, sin importar qué diga la base real).
+- `TestPaymentRepository_Create_ConcurrentSameIdempotencyKey`
+  (`internal/infrastructure/postgres`): 20 goroutines reales contra
+  Postgres, sin pasar por `PaymentService`. Prueba que la restricción
+  única **de la base de datos** realmente existe y funciona — pero no
+  detectaría un bug en la lógica de reintento de `PaymentService`
+  (nunca pasa por ahí).
+
+Ambos se corrieron repetidamente (20 y 10 veces seguidas respectivamente)
+sin un solo fallo, para descartar que fuera casualidad.
 
 ## Decisiones técnicas
 
@@ -185,7 +248,7 @@ de pagos, y las pruebas del worker de conciliación en Python.)_
     vivían en `internal/infrastructure/postgres`, porque solo
     `transport/http` necesitaba reconocerlos — una capa "de arriba"
     conociendo detalles de una "de abajo" no rompe la regla. Eso cambió
-    en la: `PaymentService` (en `application`, la capa
+    en la Fase 4: `PaymentService` (en `application`, la capa
     *intermedia*) necesita inspeccionar estos errores para decidir si
     hacer replay de idempotencia o reintentar una creación de pago. Si
     siguieran en `postgres`, `application` terminaría dependiendo de
@@ -254,10 +317,11 @@ de pagos, y las pruebas del worker de conciliación en Python.)_
     (aritmética un poco más lenta que con floats nativos) es irrelevante
     para el volumen de este sistema.
 - **Autenticación:** JWT.
-- **Redis:** usado como componente para (1) idempotencia
-  rápida en la creación de pagos junto a la restricción única en Postgres,
-  y (2) cache del endpoint de resumen por comercio, invalidada al cambiar
-  el estado de un pago.
+- **Redis:** usado para (1) lock
+  rápido de idempotencia en la creación de pagos (ver sección
+  "Idempotencia y concurrencia" — ya implementado, `internal/infrastructure/redis`),
+  y (2) cache del endpoint de resumen por comercio (Fase 6, todavía no
+  implementado), invalidada al cambiar el estado de un pago.
 
 _(Se irán agregando las decisiones puntuales de cada fase, con su
 justificación.)_
