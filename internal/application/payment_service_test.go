@@ -127,6 +127,44 @@ func (r *inMemoryPaymentRepository) rowCount() int {
 	return len(r.byID)
 }
 
+func (r *inMemoryPaymentRepository) List(_ context.Context, _ application.PaymentFilter) ([]*domain.Payment, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	payments := make([]*domain.Payment, 0, len(r.byID))
+	for _, p := range r.byID {
+		payments = append(payments, p)
+	}
+	return payments, nil
+}
+
+func (r *inMemoryPaymentRepository) Count(_ context.Context, _ application.PaymentFilter) (int64, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return int64(len(r.byID)), nil
+}
+
+type inMemoryHistoryRepository struct {
+	mu      sync.Mutex
+	entries map[string][]*domain.PaymentStatusHistory
+}
+
+func newInMemoryHistoryRepository() *inMemoryHistoryRepository {
+	return &inMemoryHistoryRepository{entries: make(map[string][]*domain.PaymentStatusHistory)}
+}
+
+func (r *inMemoryHistoryRepository) Create(_ context.Context, history *domain.PaymentStatusHistory) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.entries[history.PaymentID] = append(r.entries[history.PaymentID], history)
+	return nil
+}
+
+func (r *inMemoryHistoryRepository) ListByPaymentID(_ context.Context, paymentID string) ([]*domain.PaymentStatusHistory, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.entries[paymentID], nil
+}
+
 func seedMerchant(t *testing.T, repo *inMemoryMerchantRepository) *domain.Merchant {
 	t.Helper()
 	merchant, err := domain.NewMerchant("Comercio Prueba", "900123456", "comercio@example.com")
@@ -135,15 +173,16 @@ func seedMerchant(t *testing.T, repo *inMemoryMerchantRepository) *domain.Mercha
 	return merchant
 }
 
-func newPaymentServiceForTest() (*application.PaymentService, *inMemoryMerchantRepository, *inMemoryPaymentRepository) {
+func newPaymentServiceForTest() (*application.PaymentService, *inMemoryMerchantRepository, *inMemoryPaymentRepository, *inMemoryHistoryRepository) {
 	merchants := newInMemoryMerchantRepository()
 	payments := newInMemoryPaymentRepository()
-	service := application.NewPaymentService(payments, merchants, application.NoopIdempotencyLocker{})
-	return service, merchants, payments
+	history := newInMemoryHistoryRepository()
+	service := application.NewPaymentService(payments, merchants, history, application.NoopIdempotencyLocker{})
+	return service, merchants, payments, history
 }
 
 func TestPaymentService_Create_Valid(t *testing.T) {
-	service, merchants, _ := newPaymentServiceForTest()
+	service, merchants, _, _ := newPaymentServiceForTest()
 	merchant := seedMerchant(t, merchants)
 
 	payment, err := service.Create(context.Background(), merchant.ID, "ORDER-1", decimal.NewFromInt(1000), "COP", domain.PaymentMethodQR, "key-1")
@@ -153,7 +192,7 @@ func TestPaymentService_Create_Valid(t *testing.T) {
 }
 
 func TestPaymentService_Create_MissingIdempotencyKey(t *testing.T) {
-	service, merchants, _ := newPaymentServiceForTest()
+	service, merchants, _, _ := newPaymentServiceForTest()
 	merchant := seedMerchant(t, merchants)
 
 	_, err := service.Create(context.Background(), merchant.ID, "ORDER-1", decimal.NewFromInt(1000), "COP", domain.PaymentMethodQR, "")
@@ -162,7 +201,7 @@ func TestPaymentService_Create_MissingIdempotencyKey(t *testing.T) {
 }
 
 func TestPaymentService_Create_MerchantNotFound(t *testing.T) {
-	service, _, _ := newPaymentServiceForTest()
+	service, _, _, _ := newPaymentServiceForTest()
 
 	_, err := service.Create(context.Background(), "id-inventado", "ORDER-1", decimal.NewFromInt(1000), "COP", domain.PaymentMethodQR, "key-1")
 
@@ -170,7 +209,7 @@ func TestPaymentService_Create_MerchantNotFound(t *testing.T) {
 }
 
 func TestPaymentService_Create_IdempotentReplay(t *testing.T) {
-	service, merchants, _ := newPaymentServiceForTest()
+	service, merchants, _, _ := newPaymentServiceForTest()
 	merchant := seedMerchant(t, merchants)
 	key := "key-1"
 
@@ -184,7 +223,7 @@ func TestPaymentService_Create_IdempotentReplay(t *testing.T) {
 }
 
 func TestPaymentService_Create_DuplicateExternalReference(t *testing.T) {
-	service, merchants, _ := newPaymentServiceForTest()
+	service, merchants, _, _ := newPaymentServiceForTest()
 	merchant := seedMerchant(t, merchants)
 
 	_, err := service.Create(context.Background(), merchant.ID, "ORDER-1", decimal.NewFromInt(1000), "COP", domain.PaymentMethodQR, "key-1")
@@ -200,7 +239,7 @@ func TestPaymentService_Create_DuplicateExternalReference(t *testing.T) {
 // del repositorio (que simula la restricción única de Postgres), no del
 // lock de Redis — exactamente la garantía que documentamos en el README.
 func TestPaymentService_Create_Concurrent(t *testing.T) {
-	service, merchants, payments := newPaymentServiceForTest()
+	service, merchants, payments, _ := newPaymentServiceForTest()
 	merchant := seedMerchant(t, merchants)
 
 	const attempts = 20
@@ -231,4 +270,73 @@ func TestPaymentService_Create_Concurrent(t *testing.T) {
 	}
 
 	require.Equal(t, 1, payments.rowCount(), "no debe haberse creado más de un pago con la misma Idempotency-Key")
+}
+
+func TestPaymentService_UpdateStatus_Valid(t *testing.T) {
+	service, merchants, _, history := newPaymentServiceForTest()
+	merchant := seedMerchant(t, merchants)
+	payment, err := service.Create(context.Background(), merchant.ID, "ORDER-1", decimal.NewFromInt(1000), "COP", domain.PaymentMethodQR, "key-1")
+	require.NoError(t, err)
+
+	updated, err := service.UpdateStatus(context.Background(), payment.ID, domain.PaymentStatusApproved, "pago confirmado", "test-user")
+
+	require.NoError(t, err)
+	require.Equal(t, domain.PaymentStatusApproved, updated.Status)
+
+	entries, err := history.ListByPaymentID(context.Background(), payment.ID)
+	require.NoError(t, err)
+	require.Len(t, entries, 1)
+	require.Equal(t, domain.PaymentStatusPending, entries[0].PreviousStatus)
+	require.Equal(t, domain.PaymentStatusApproved, entries[0].NewStatus)
+	require.Equal(t, "test-user", entries[0].ChangedBy)
+}
+
+func TestPaymentService_UpdateStatus_InvalidTransition(t *testing.T) {
+	service, merchants, _, _ := newPaymentServiceForTest()
+	merchant := seedMerchant(t, merchants)
+	payment, err := service.Create(context.Background(), merchant.ID, "ORDER-1", decimal.NewFromInt(1000), "COP", domain.PaymentMethodQR, "key-1")
+	require.NoError(t, err)
+	_, err = service.UpdateStatus(context.Background(), payment.ID, domain.PaymentStatusApproved, "ok", "test-user")
+	require.NoError(t, err)
+
+	_, err = service.UpdateStatus(context.Background(), payment.ID, domain.PaymentStatusRejected, "no debería poder", "test-user")
+
+	require.ErrorIs(t, err, domain.ErrInvalidStatusTransition)
+}
+
+func TestPaymentService_UpdateStatus_PaymentNotFound(t *testing.T) {
+	service, _, _, _ := newPaymentServiceForTest()
+
+	_, err := service.UpdateStatus(context.Background(), "id-inventado", domain.PaymentStatusApproved, "x", "test-user")
+
+	require.ErrorIs(t, err, application.ErrNotFound)
+}
+
+func TestPaymentService_History_PaymentNotFound(t *testing.T) {
+	service, _, _, _ := newPaymentServiceForTest()
+
+	_, err := service.History(context.Background(), "id-inventado")
+
+	require.ErrorIs(t, err, application.ErrNotFound)
+}
+
+func TestPaymentService_List_DefaultsPageAndLimit(t *testing.T) {
+	service, merchants, _, _ := newPaymentServiceForTest()
+	merchant := seedMerchant(t, merchants)
+	_, err := service.Create(context.Background(), merchant.ID, "ORDER-1", decimal.NewFromInt(1000), "COP", domain.PaymentMethodQR, "key-1")
+	require.NoError(t, err)
+
+	payments, total, err := service.List(context.Background(), application.PaymentFilter{})
+
+	require.NoError(t, err)
+	require.Len(t, payments, 1)
+	require.Equal(t, int64(1), total)
+}
+
+func TestPaymentService_List_LimitCappedAtMax(t *testing.T) {
+	service, _, _, _ := newPaymentServiceForTest()
+
+	_, _, err := service.List(context.Background(), application.PaymentFilter{Limit: application.MaxLimit + 1000})
+
+	require.NoError(t, err)
 }

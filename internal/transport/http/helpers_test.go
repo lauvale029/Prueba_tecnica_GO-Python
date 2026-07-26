@@ -2,6 +2,7 @@ package http_test
 
 import (
 	"context"
+	"sort"
 	"sync"
 
 	"github.com/gofiber/fiber/v2"
@@ -129,21 +130,104 @@ func (f *fakePaymentRepository) UpdateStatus(_ context.Context, payment *domain.
 	return nil
 }
 
+// List/Count sí filtran de verdad (a diferencia del fake equivalente en
+// internal/application): acá queremos probar que los query params del
+// endpoint HTTP realmente se traducen en el filtrado correcto de punta a
+// punta.
+func (f *fakePaymentRepository) List(_ context.Context, filter application.PaymentFilter) ([]*domain.Payment, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	var result []*domain.Payment
+	for _, p := range f.byID {
+		if matchesPaymentFilter(p, filter) {
+			result = append(result, p)
+		}
+	}
+	sort.Slice(result, func(i, j int) bool { return result[i].CreatedAt.After(result[j].CreatedAt) })
+
+	start := (filter.Page - 1) * filter.Limit
+	if start > len(result) {
+		start = len(result)
+	}
+	end := start + filter.Limit
+	if end > len(result) {
+		end = len(result)
+	}
+	return result[start:end], nil
+}
+
+func (f *fakePaymentRepository) Count(_ context.Context, filter application.PaymentFilter) (int64, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	var count int64
+	for _, p := range f.byID {
+		if matchesPaymentFilter(p, filter) {
+			count++
+		}
+	}
+	return count, nil
+}
+
+func matchesPaymentFilter(p *domain.Payment, filter application.PaymentFilter) bool {
+	if filter.MerchantID != nil && p.MerchantID != *filter.MerchantID {
+		return false
+	}
+	if filter.Status != nil && p.Status != *filter.Status {
+		return false
+	}
+	if filter.PaymentMethod != nil && p.PaymentMethod != *filter.PaymentMethod {
+		return false
+	}
+	if filter.DateFrom != nil && p.CreatedAt.Before(*filter.DateFrom) {
+		return false
+	}
+	if filter.DateTo != nil && p.CreatedAt.After(*filter.DateTo) {
+		return false
+	}
+	return true
+}
+
+type fakeHistoryRepository struct {
+	mu      sync.Mutex
+	entries map[string][]*domain.PaymentStatusHistory
+}
+
+func newFakeHistoryRepository() *fakeHistoryRepository {
+	return &fakeHistoryRepository{entries: make(map[string][]*domain.PaymentStatusHistory)}
+}
+
+func (f *fakeHistoryRepository) Create(_ context.Context, history *domain.PaymentStatusHistory) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.entries[history.PaymentID] = append(f.entries[history.PaymentID], history)
+	return nil
+}
+
+func (f *fakeHistoryRepository) ListByPaymentID(_ context.Context, paymentID string) ([]*domain.PaymentStatusHistory, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.entries[paymentID], nil
+}
+
 // testApp agrupa lo que necesitan los tests de este paquete: la app de
-// Fiber ya armada, y los dos repositorios falsos para poder "sembrar"
-// datos antes de hacer una petición HTTP.
+// Fiber ya armada, y los repositorios falsos para poder "sembrar" datos
+// antes de hacer una petición HTTP.
 type testApp struct {
 	app       *fiber.App
 	merchants *fakeMerchantRepository
 	payments  *fakePaymentRepository
+	history   *fakeHistoryRepository
 }
 
 func setupApp() testApp {
 	merchantRepo := newFakeMerchantRepository()
 	paymentRepo := newFakePaymentRepository()
+	historyRepo := newFakeHistoryRepository()
 
 	merchantService := application.NewMerchantService(merchantRepo)
-	paymentService := application.NewPaymentService(paymentRepo, merchantRepo, application.NoopIdempotencyLocker{})
+	paymentService := application.NewPaymentService(paymentRepo, merchantRepo, historyRepo, application.NoopIdempotencyLocker{})
 
 	merchantHandler := transporthttp.NewMerchantHandler(merchantService)
 	paymentHandler := transporthttp.NewPaymentHandler(paymentService)
@@ -152,5 +236,6 @@ func setupApp() testApp {
 		app:       transporthttp.NewRouter(merchantHandler, paymentHandler),
 		merchants: merchantRepo,
 		payments:  paymentRepo,
+		history:   historyRepo,
 	}
 }
