@@ -6,6 +6,7 @@ import (
 	"github.com/lauvale029/Prueba_tecnica_GO-Python/internal/application"
 	"github.com/lauvale029/Prueba_tecnica_GO-Python/internal/infrastructure/config"
 	"github.com/lauvale029/Prueba_tecnica_GO-Python/internal/infrastructure/postgres"
+	redisinfra "github.com/lauvale029/Prueba_tecnica_GO-Python/internal/infrastructure/redis"
 	transporthttp "github.com/lauvale029/Prueba_tecnica_GO-Python/internal/transport/http"
 )
 
@@ -21,11 +22,24 @@ func main() {
 	}
 	defer db.Close()
 
+	var locker application.IdempotencyLocker = application.NoopIdempotencyLocker{}
+	if cfg.RedisAddr != "" {
+		redisClient := redisinfra.NewClient(cfg.RedisAddr, cfg.RedisPassword, cfg.RedisDB)
+		locker = redisinfra.NewIdempotencyLocker(redisClient)
+		log.Printf("idempotency lock: usando Redis en %s", cfg.RedisAddr)
+	} else {
+		log.Println("idempotency lock: REDIS_ADDR no configurado, usando solo la restricción única de Postgres")
+	}
+
 	merchantRepo := postgres.NewMerchantRepository(db)
 	merchantService := application.NewMerchantService(merchantRepo)
 	merchantHandler := transporthttp.NewMerchantHandler(merchantService)
 
-	app := transporthttp.NewRouter(merchantHandler)
+	paymentRepo := postgres.NewPaymentRepository(db)
+	paymentService := application.NewPaymentService(paymentRepo, merchantRepo, locker)
+	paymentHandler := transporthttp.NewPaymentHandler(paymentService)
+
+	app := transporthttp.NewRouter(merchantHandler, paymentHandler)
 
 	log.Printf("MOVA payments API listening on port %s", cfg.Port)
 	if err := app.Listen(":" + cfg.Port); err != nil {

@@ -4,12 +4,14 @@ package postgres_test
 
 import (
 	"context"
+	"sync"
 	"testing"
 
 	"github.com/google/uuid"
 	"github.com/shopspring/decimal"
 	"github.com/stretchr/testify/require"
 
+	"github.com/lauvale029/Prueba_tecnica_GO-Python/internal/application"
 	"github.com/lauvale029/Prueba_tecnica_GO-Python/internal/domain"
 	"github.com/lauvale029/Prueba_tecnica_GO-Python/internal/infrastructure/postgres"
 )
@@ -78,7 +80,7 @@ func TestPaymentRepository_Create_DuplicateIdempotencyKey(t *testing.T) {
 
 	second := newTestPayment(t, merchant.ID, key)
 	err := repo.Create(ctx, second)
-	require.ErrorIs(t, err, postgres.ErrConflict)
+	require.ErrorIs(t, err, application.ErrConflict)
 }
 
 func TestPaymentRepository_Create_DuplicateExternalReference(t *testing.T) {
@@ -94,7 +96,54 @@ func TestPaymentRepository_Create_DuplicateExternalReference(t *testing.T) {
 	require.NoError(t, err)
 
 	err = repo.Create(ctx, second)
-	require.ErrorIs(t, err, postgres.ErrConflict)
+	require.ErrorIs(t, err, application.ErrConflict)
+}
+
+// TestPaymentRepository_Create_ConcurrentSameIdempotencyKey es la prueba
+// definitiva de la restricción única: a diferencia del test de
+// concurrencia en internal/application (que simula la atomicidad con un
+// mutex), acá 20 goroutines de verdad golpean Postgres al mismo tiempo
+// con la misma idempotency_key. Sin la restricción UNIQUE, esto podría
+// crear más de una fila; con ella, es imposible.
+func TestPaymentRepository_Create_ConcurrentSameIdempotencyKey(t *testing.T) {
+	db := testDB(t)
+	merchant := createTestMerchant(t, db)
+	repo := postgres.NewPaymentRepository(db)
+
+	const attempts = 20
+	key := "key-" + uuid.New().String()
+
+	var wg sync.WaitGroup
+	errs := make([]error, attempts)
+
+	for i := 0; i < attempts; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			payment, err := domain.NewPayment(merchant.ID, "ORDER-"+uuid.New().String(), decimal.NewFromInt(1000), "COP", domain.PaymentMethodQR, key)
+			if err != nil {
+				errs[i] = err
+				return
+			}
+			errs[i] = repo.Create(context.Background(), payment)
+		}(i)
+	}
+	wg.Wait()
+
+	successes := 0
+	for _, err := range errs {
+		if err == nil {
+			successes++
+			continue
+		}
+		require.ErrorIs(t, err, application.ErrConflict, "cualquier fallo debe ser por la restricción única, no otro error")
+	}
+
+	require.Equal(t, 1, successes, "exactamente una inserción concurrente debe tener éxito")
+
+	found, err := repo.GetByIdempotencyKey(context.Background(), key)
+	require.NoError(t, err)
+	require.NotNil(t, found)
 }
 
 func TestPaymentRepository_UpdateStatus(t *testing.T) {

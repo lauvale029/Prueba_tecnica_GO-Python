@@ -9,6 +9,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/stretchr/testify/require"
 
+	"github.com/lauvale029/Prueba_tecnica_GO-Python/internal/application"
 	"github.com/lauvale029/Prueba_tecnica_GO-Python/internal/domain"
 	"github.com/lauvale029/Prueba_tecnica_GO-Python/internal/infrastructure/postgres"
 )
@@ -33,7 +34,7 @@ func TestMerchantRepository_GetByID_NotFound(t *testing.T) {
 	repo := postgres.NewMerchantRepository(db)
 
 	_, err := repo.GetByID(context.Background(), uuid.New().String())
-	require.ErrorIs(t, err, postgres.ErrNotFound)
+	require.ErrorIs(t, err, application.ErrNotFound)
 }
 
 func TestMerchantRepository_Create_DuplicateDocumentNumber(t *testing.T) {
@@ -47,5 +48,5 @@ func TestMerchantRepository_Create_DuplicateDocumentNumber(t *testing.T) {
 	require.NoError(t, err)
 
 	err = repo.Create(ctx, second)
-	require.ErrorIs(t, err, postgres.ErrConflict)
+	require.ErrorIs(t, err, application.ErrConflict)
 }
