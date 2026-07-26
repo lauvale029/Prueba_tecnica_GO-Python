@@ -86,8 +86,14 @@ docker compose up --build
 Esto levanta la API, PostgreSQL y Redis. La API queda disponible en
 `http://localhost:8080`.
 
-_(Instrucciones de ejecución local sin Docker: pendiente, se agregan cuando el
-servidor HTTP esté implementado.)_
+**Sin Docker** (con Postgres ya levantado y migrado, ver siguiente sección):
+
+```bash
+go run ./cmd/api
+```
+
+Lee `PORT` y `DATABASE_URL` de tu `.env` (vía `godotenv`) o de variables de
+entorno ya exportadas; `PORT` por defecto es `8080` si no se define.
 
 ## Migraciones
 
@@ -144,8 +150,17 @@ recurso no existe, `ErrConflict` cuando se viola una restricción única
 `merchant_id + external_reference` duplicados), actualización de estado, y
 creación/listado del historial de estados.
 
-_(Se irán agregando, por fase: pruebas de los endpoints HTTP con
-idempotencia y concurrencia, y las del worker de conciliación en Python.)_
+`internal/application` (5 tests) prueba `MerchantService` con un
+repositorio falso en memoria: que el dominio valide antes de persistir
+(el fake nunca recibe el dato si el email es inválido), y que los errores
+del repositorio se propaguen sin modificarse. `internal/transport/http`
+(6 tests) prueba los endpoints `POST`/`GET /api/v1/merchants` completos
+con `app.Test(...)` de Fiber (request/response JSON reales, sin red),
+cubriendo los distintos códigos HTTP posibles (`201`, `200`, `404`,
+`409`, `422`, `400`). Ninguno de los dos necesita Postgres.
+
+_(Se irán agregando, por fase: idempotencia y concurrencia en la creación
+de pagos, y las pruebas del worker de conciliación en Python.)_
 
 ## Decisiones técnicas
 
@@ -165,8 +180,26 @@ idempotencia y concurrencia, y las del worker de conciliación en Python.)_
   - **Protección del dominio:** las reglas de negocio quedan aisladas de
     detalles que cambian con el tiempo (versión de Fiber, del driver SQL,
     etc.), en vez de estar mezcladas con código de framework.
+  - **Regla para los dobles de prueba (fakes) en tests:** los tests de
+    `internal/application` usan repositorios falsos con errores
+    **inventados** (`errors.New("...")`), no los errores concretos de
+    `internal/infrastructure/postgres` — si reutilizaran `postgres.ErrNotFound`,
+    `application` terminaría importando `infrastructure` en sus tests,
+    rompiendo la misma separación que esta decisión documenta. Los tests
+    de `internal/transport/http` sí pueden usar `postgres.ErrNotFound`/`ErrConflict`,
+    porque el código de producción de esa capa (`merchant_handler.go`) ya
+    los conoce a propósito (para traducirlos a códigos HTTP).
 - **Framework HTTP:** Fiber, por ser el preferido según el anexo de la
   prueba y su bajo overhead sobre `fasthttp`.
+- **Timestamps siempre en UTC en las respuestas:** los handlers formatean
+  `CreatedAt`/`UpdatedAt` con `.UTC().Format(time.RFC3339)`, nunca solo
+  `.Format(time.RFC3339)`. El motivo: un `time.Time` recién creado en el
+  dominio ya está en UTC, pero el mismo valor leído de vuelta desde
+  Postgres a través de `pgx` llega en la zona horaria local del proceso —
+  incluso siendo el mismo instante exacto, se mostraba distinto según si
+  el dato venía de un `Create` o de un `GetByID` (`...Z` vs. `...-05:00`).
+  Forzar `.UTC()` al serializar deja el formato consistente sin importar
+  el origen del dato.
 - **Acceso a datos — por qué no un ORM:** se usa `sqlc` + `database/sql`
   (con `pgx` registrado como driver) en vez de un ORM como GORM.
   - El SQL se escribe a mano en `internal/infrastructure/postgres/queries/*.sql`
