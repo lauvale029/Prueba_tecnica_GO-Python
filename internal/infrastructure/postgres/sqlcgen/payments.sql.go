@@ -7,10 +7,42 @@ package sqlcgen
 
 import (
 	"context"
+	"database/sql"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/shopspring/decimal"
 )
+
+const countPayments = `-- name: CountPayments :one
+SELECT count(*) FROM payments
+WHERE ($1::uuid IS NULL OR merchant_id = $1)
+  AND ($2::text IS NULL OR status = $2)
+  AND ($3::text IS NULL OR payment_method = $3)
+  AND ($4::timestamptz IS NULL OR created_at >= $4)
+  AND ($5::timestamptz IS NULL OR created_at <= $5)
+`
+
+type CountPaymentsParams struct {
+	MerchantID    uuid.NullUUID
+	Status        sql.NullString
+	PaymentMethod sql.NullString
+	DateFrom      sql.NullTime
+	DateTo        sql.NullTime
+}
+
+func (q *Queries) CountPayments(ctx context.Context, arg CountPaymentsParams) (int64, error) {
+	row := q.db.QueryRowContext(ctx, countPayments,
+		arg.MerchantID,
+		arg.Status,
+		arg.PaymentMethod,
+		arg.DateFrom,
+		arg.DateTo,
+	)
+	var count int64
+	err := row.Scan(&count)
+	return count, err
+}
 
 const createPayment = `-- name: CreatePayment :one
 INSERT INTO payments (
@@ -135,6 +167,69 @@ func (q *Queries) GetPaymentByMerchantAndExternalReference(ctx context.Context, 
 		&i.UpdatedAt,
 	)
 	return i, err
+}
+
+const listPayments = `-- name: ListPayments :many
+SELECT id, merchant_id, external_reference, amount, currency, payment_method, status, idempotency_key, created_at, updated_at FROM payments
+WHERE ($1::uuid IS NULL OR merchant_id = $1)
+  AND ($2::text IS NULL OR status = $2)
+  AND ($3::text IS NULL OR payment_method = $3)
+  AND ($4::timestamptz IS NULL OR created_at >= $4)
+  AND ($5::timestamptz IS NULL OR created_at <= $5)
+ORDER BY created_at DESC
+LIMIT $7 OFFSET $6
+`
+
+type ListPaymentsParams struct {
+	MerchantID    uuid.NullUUID
+	Status        sql.NullString
+	PaymentMethod sql.NullString
+	DateFrom      sql.NullTime
+	DateTo        sql.NullTime
+	PageOffset    int32
+	PageLimit     int32
+}
+
+func (q *Queries) ListPayments(ctx context.Context, arg ListPaymentsParams) ([]Payment, error) {
+	rows, err := q.db.QueryContext(ctx, listPayments,
+		arg.MerchantID,
+		arg.Status,
+		arg.PaymentMethod,
+		arg.DateFrom,
+		arg.DateTo,
+		arg.PageOffset,
+		arg.PageLimit,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []Payment
+	for rows.Next() {
+		var i Payment
+		if err := rows.Scan(
+			&i.ID,
+			&i.MerchantID,
+			&i.ExternalReference,
+			&i.Amount,
+			&i.Currency,
+			&i.PaymentMethod,
+			&i.Status,
+			&i.IdempotencyKey,
+			&i.CreatedAt,
+			&i.UpdatedAt,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
 }
 
 const updatePaymentStatus = `-- name: UpdatePaymentStatus :one

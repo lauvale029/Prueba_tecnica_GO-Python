@@ -2,9 +2,22 @@ package application
 
 import (
 	"context"
+	"time"
 
 	"github.com/lauvale029/Prueba_tecnica_GO-Python/internal/domain"
 )
+
+// PaymentFilter agrupa los filtros opcionales para listar pagos. Un
+// campo en nil significa "sin filtro" para ese campo
+type PaymentFilter struct {
+	MerchantID    *string
+	Status        *domain.PaymentStatus
+	PaymentMethod *domain.PaymentMethod
+	DateFrom      *time.Time
+	DateTo        *time.Time
+	Page          int
+	Limit         int
+}
 
 // MerchantRepository es el puerto que la capa de aplicación espera de
 // quien persista comercios
@@ -20,6 +33,8 @@ type PaymentRepository interface {
 	GetByIdempotencyKey(ctx context.Context, idempotencyKey string) (*domain.Payment, error)
 	GetByMerchantAndExternalReference(ctx context.Context, merchantID, externalReference string) (*domain.Payment, error)
 	UpdateStatus(ctx context.Context, payment *domain.Payment) error
+	List(ctx context.Context, filter PaymentFilter) ([]*domain.Payment, error)
+	Count(ctx context.Context, filter PaymentFilter) (int64, error)
 }
 
 // PaymentStatusHistoryRepository es el puerto para el historial de cambios
