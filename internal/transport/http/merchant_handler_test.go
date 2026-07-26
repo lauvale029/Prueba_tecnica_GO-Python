@@ -14,13 +14,12 @@ import (
 
 	"github.com/lauvale029/Prueba_tecnica_GO-Python/internal/application"
 	"github.com/lauvale029/Prueba_tecnica_GO-Python/internal/domain"
-	"github.com/lauvale029/Prueba_tecnica_GO-Python/internal/infrastructure/postgres"
 	transporthttp "github.com/lauvale029/Prueba_tecnica_GO-Python/internal/transport/http"
 )
 
-// fakeMerchantRepository sí reutiliza los errores de postgres a propósito:
-// merchant_handler.go (código de producción) ya los conoce, así que el
-// test ejercita la traducción real a códigos HTTP.
+// fakeMerchantRepository reutiliza application.ErrNotFound/ErrConflict
+// a propósito: merchant_handler.go (código de producción) ya los conoce,
+// así que el test ejercita la traducción real a códigos HTTP.
 type fakeMerchantRepository struct {
 	mu              sync.Mutex
 	merchants       map[string]*domain.Merchant
@@ -39,7 +38,7 @@ func (f *fakeMerchantRepository) Create(_ context.Context, merchant *domain.Merc
 	defer f.mu.Unlock()
 
 	if f.documentNumbers[merchant.DocumentNumber] {
-		return postgres.ErrConflict
+		return application.ErrConflict
 	}
 	f.merchants[merchant.ID] = merchant
 	f.documentNumbers[merchant.DocumentNumber] = true
@@ -52,7 +51,7 @@ func (f *fakeMerchantRepository) GetByID(_ context.Context, id string) (*domain.
 
 	merchant, ok := f.merchants[id]
 	if !ok {
-		return nil, postgres.ErrNotFound
+		return nil, application.ErrNotFound
 	}
 	return merchant, nil
 }

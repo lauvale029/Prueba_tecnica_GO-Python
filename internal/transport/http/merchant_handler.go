@@ -8,7 +8,6 @@ import (
 
 	"github.com/lauvale029/Prueba_tecnica_GO-Python/internal/application"
 	"github.com/lauvale029/Prueba_tecnica_GO-Python/internal/domain"
-	"github.com/lauvale029/Prueba_tecnica_GO-Python/internal/infrastructure/postgres"
 )
 
 type MerchantHandler struct {
@@ -76,9 +75,9 @@ func (h *MerchantHandler) Get(c *fiber.Ctx) error {
 
 func respondMerchantError(c *fiber.Ctx, err error) error {
 	switch {
-	case errors.Is(err, postgres.ErrNotFound):
+	case errors.Is(err, application.ErrNotFound):
 		return respondError(c, fiber.StatusNotFound, "MERCHANT_NOT_FOUND", "el comercio solicitado no existe")
-	case errors.Is(err, postgres.ErrConflict):
+	case errors.Is(err, application.ErrConflict):
 		return respondError(c, fiber.StatusConflict, "MERCHANT_ALREADY_EXISTS", "ya existe un comercio con ese número de documento")
 	case errors.Is(err, domain.ErrMissingMerchantName),
 		errors.Is(err, domain.ErrMissingDocumentNumber),

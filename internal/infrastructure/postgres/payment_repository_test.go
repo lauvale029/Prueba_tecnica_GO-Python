@@ -10,6 +10,7 @@ import (
 	"github.com/shopspring/decimal"
 	"github.com/stretchr/testify/require"
 
+	"github.com/lauvale029/Prueba_tecnica_GO-Python/internal/application"
 	"github.com/lauvale029/Prueba_tecnica_GO-Python/internal/domain"
 	"github.com/lauvale029/Prueba_tecnica_GO-Python/internal/infrastructure/postgres"
 )
@@ -78,7 +79,7 @@ func TestPaymentRepository_Create_DuplicateIdempotencyKey(t *testing.T) {
 
 	second := newTestPayment(t, merchant.ID, key)
 	err := repo.Create(ctx, second)
-	require.ErrorIs(t, err, postgres.ErrConflict)
+	require.ErrorIs(t, err, application.ErrConflict)
 }
 
 func TestPaymentRepository_Create_DuplicateExternalReference(t *testing.T) {
@@ -94,7 +95,7 @@ func TestPaymentRepository_Create_DuplicateExternalReference(t *testing.T) {
 	require.NoError(t, err)
 
 	err = repo.Create(ctx, second)
-	require.ErrorIs(t, err, postgres.ErrConflict)
+	require.ErrorIs(t, err, application.ErrConflict)
 }
 
 func TestPaymentRepository_UpdateStatus(t *testing.T) {

@@ -171,7 +171,7 @@ de pagos, y las pruebas del worker de conciliación en Python.)_
   `ports.go`), sin saber si detrás hay Postgres, otra base, o un mock;
   `internal/infrastructure` (Postgres, Redis) y `internal/transport` (HTTP)
   son los "adaptadores" que implementan esos puertos o los consumen.
-  - **Testabilidad:** los casos de uso (Fase 3+) se pueden probar contra un
+  - **Testabilidad:** los casos de uso se pueden probar contra un
     repositorio falso en memoria, sin levantar Postgres — las pruebas de
     reglas de negocio no dependen de infraestructura real.
   - **Reemplazabilidad:** cambiar de Postgres a otra base de datos, o
@@ -180,15 +180,29 @@ de pagos, y las pruebas del worker de conciliación en Python.)_
   - **Protección del dominio:** las reglas de negocio quedan aisladas de
     detalles que cambian con el tiempo (versión de Fiber, del driver SQL,
     etc.), en vez de estar mezcladas con código de framework.
-  - **Regla para los dobles de prueba (fakes) en tests:** los tests de
-    `internal/application` usan repositorios falsos con errores
-    **inventados** (`errors.New("...")`), no los errores concretos de
-    `internal/infrastructure/postgres` — si reutilizaran `postgres.ErrNotFound`,
-    `application` terminaría importando `infrastructure` en sus tests,
-    rompiendo la misma separación que esta decisión documenta. Los tests
-    de `internal/transport/http` sí pueden usar `postgres.ErrNotFound`/`ErrConflict`,
-    porque el código de producción de esa capa (`merchant_handler.go`) ya
-    los conoce a propósito (para traducirlos a códigos HTTP).
+  - **`ErrNotFound`/`ErrConflict` viven en `application`, no en
+    `infrastructure`:** originalmente estos dos errores genéricos
+    vivían en `internal/infrastructure/postgres`, porque solo
+    `transport/http` necesitaba reconocerlos — una capa "de arriba"
+    conociendo detalles de una "de abajo" no rompe la regla. Eso cambió
+    en la: `PaymentService` (en `application`, la capa
+    *intermedia*) necesita inspeccionar estos errores para decidir si
+    hacer replay de idempotencia o reintentar una creación de pago. Si
+    siguieran en `postgres`, `application` terminaría dependiendo de
+    `infrastructure`, invirtiendo la flecha de dependencia. Por eso ahora
+    viven en `internal/application/errors.go`, como parte del contrato
+    del puerto: cualquier repositorio (Postgres, un fake de test, u otra
+    base) debe devolver estos errores genéricos, y `postgres.mapError`
+    los reutiliza en vez de definir los suyos.
+  - **Regla para los dobles de prueba (fakes) en tests:** cuando el
+    código bajo prueba **no inspecciona** el error, solo lo reenvía (ej.
+    `MerchantService`), el fake puede usar un error inventado
+    (`errors.New("...")`) — lo único que importa es que el servicio lo
+    deje pasar sin tocarlo. Cuando el código **sí** decide en base al
+    tipo de error (ej. `PaymentService`, que distingue "no existe" de
+    "conflicto" para decidir si reintenta), el fake debe devolver los
+    errores reales (`application.ErrNotFound`/`ErrConflict`), porque ahí
+    la identidad del error es parte de la lógica que se está probando.
 - **Framework HTTP:** Fiber, por ser el preferido según el anexo de la
   prueba y su bajo overhead sobre `fasthttp`.
 - **Timestamps siempre en UTC en las respuestas:** los handlers formatean
