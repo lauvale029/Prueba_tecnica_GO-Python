@@ -12,6 +12,10 @@ func NewRouter(merchantHandler *MerchantHandler, paymentHandler *PaymentHandler)
 	v1.Get("/merchants/:merchant_id", merchantHandler.Get)
 
 	v1.Post("/payments", paymentHandler.Create)
+	v1.Get("/payments", paymentHandler.List)
+	v1.Get("/payments/:payment_id", paymentHandler.Get)
+	v1.Patch("/payments/:payment_id/status", paymentHandler.UpdateStatus)
+	v1.Get("/payments/:payment_id/history", paymentHandler.History)
 
 	return app
 }
