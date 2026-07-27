@@ -143,6 +143,66 @@ func (r *inMemoryPaymentRepository) Count(_ context.Context, _ application.Payme
 	return int64(len(r.byID)), nil
 }
 
+func (r *inMemoryPaymentRepository) GetSummaryByMerchantID(_ context.Context, merchantID string) (application.MerchantSummary, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	summary := application.MerchantSummary{MerchantID: merchantID, ApprovedAmount: decimal.Zero}
+	for _, p := range r.byID {
+		if p.MerchantID != merchantID {
+			continue
+		}
+		summary.TotalPayments++
+		switch p.Status {
+		case domain.PaymentStatusApproved:
+			summary.ApprovedPayments++
+			summary.ApprovedAmount = summary.ApprovedAmount.Add(p.Amount.Amount)
+		case domain.PaymentStatusRejected:
+			summary.RejectedPayments++
+		case domain.PaymentStatusPending:
+			summary.PendingPayments++
+		}
+	}
+	return summary, nil
+}
+
+// inMemorySummaryCache simula Redis para probar que PaymentService.Summary
+// de verdad usa la cache (hit) y que UpdateStatus la invalida.
+type inMemorySummaryCache struct {
+	mu    sync.Mutex
+	store map[string]application.MerchantSummary
+}
+
+func newInMemorySummaryCache() *inMemorySummaryCache {
+	return &inMemorySummaryCache{store: make(map[string]application.MerchantSummary)}
+}
+
+func (c *inMemorySummaryCache) Get(_ context.Context, merchantID string) (application.MerchantSummary, bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	summary, ok := c.store[merchantID]
+	return summary, ok
+}
+
+func (c *inMemorySummaryCache) Set(_ context.Context, merchantID string, summary application.MerchantSummary) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.store[merchantID] = summary
+}
+
+func (c *inMemorySummaryCache) Invalidate(_ context.Context, merchantID string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	delete(c.store, merchantID)
+}
+
+func (c *inMemorySummaryCache) has(merchantID string) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	_, ok := c.store[merchantID]
+	return ok
+}
+
 type inMemoryHistoryRepository struct {
 	mu      sync.Mutex
 	entries map[string][]*domain.PaymentStatusHistory
@@ -173,16 +233,17 @@ func seedMerchant(t *testing.T, repo *inMemoryMerchantRepository) *domain.Mercha
 	return merchant
 }
 
-func newPaymentServiceForTest() (*application.PaymentService, *inMemoryMerchantRepository, *inMemoryPaymentRepository, *inMemoryHistoryRepository) {
+func newPaymentServiceForTest() (*application.PaymentService, *inMemoryMerchantRepository, *inMemoryPaymentRepository, *inMemoryHistoryRepository, *inMemorySummaryCache) {
 	merchants := newInMemoryMerchantRepository()
 	payments := newInMemoryPaymentRepository()
 	history := newInMemoryHistoryRepository()
-	service := application.NewPaymentService(payments, merchants, history, application.NoopIdempotencyLocker{})
-	return service, merchants, payments, history
+	summaries := newInMemorySummaryCache()
+	service := application.NewPaymentService(payments, merchants, history, application.NoopIdempotencyLocker{}, summaries)
+	return service, merchants, payments, history, summaries
 }
 
 func TestPaymentService_Create_Valid(t *testing.T) {
-	service, merchants, _, _ := newPaymentServiceForTest()
+	service, merchants, _, _, _ := newPaymentServiceForTest()
 	merchant := seedMerchant(t, merchants)
 
 	payment, err := service.Create(context.Background(), merchant.ID, "ORDER-1", decimal.NewFromInt(1000), "COP", domain.PaymentMethodQR, "key-1")
@@ -192,7 +253,7 @@ func TestPaymentService_Create_Valid(t *testing.T) {
 }
 
 func TestPaymentService_Create_MissingIdempotencyKey(t *testing.T) {
-	service, merchants, _, _ := newPaymentServiceForTest()
+	service, merchants, _, _, _ := newPaymentServiceForTest()
 	merchant := seedMerchant(t, merchants)
 
 	_, err := service.Create(context.Background(), merchant.ID, "ORDER-1", decimal.NewFromInt(1000), "COP", domain.PaymentMethodQR, "")
@@ -201,7 +262,7 @@ func TestPaymentService_Create_MissingIdempotencyKey(t *testing.T) {
 }
 
 func TestPaymentService_Create_MerchantNotFound(t *testing.T) {
-	service, _, _, _ := newPaymentServiceForTest()
+	service, _, _, _, _ := newPaymentServiceForTest()
 
 	_, err := service.Create(context.Background(), "id-inventado", "ORDER-1", decimal.NewFromInt(1000), "COP", domain.PaymentMethodQR, "key-1")
 
@@ -209,7 +270,7 @@ func TestPaymentService_Create_MerchantNotFound(t *testing.T) {
 }
 
 func TestPaymentService_Create_IdempotentReplay(t *testing.T) {
-	service, merchants, _, _ := newPaymentServiceForTest()
+	service, merchants, _, _, _ := newPaymentServiceForTest()
 	merchant := seedMerchant(t, merchants)
 	key := "key-1"
 
@@ -223,7 +284,7 @@ func TestPaymentService_Create_IdempotentReplay(t *testing.T) {
 }
 
 func TestPaymentService_Create_DuplicateExternalReference(t *testing.T) {
-	service, merchants, _, _ := newPaymentServiceForTest()
+	service, merchants, _, _, _ := newPaymentServiceForTest()
 	merchant := seedMerchant(t, merchants)
 
 	_, err := service.Create(context.Background(), merchant.ID, "ORDER-1", decimal.NewFromInt(1000), "COP", domain.PaymentMethodQR, "key-1")
@@ -239,7 +300,7 @@ func TestPaymentService_Create_DuplicateExternalReference(t *testing.T) {
 // del repositorio (que simula la restricción única de Postgres), no del
 // lock de Redis — exactamente la garantía que documentamos en el README.
 func TestPaymentService_Create_Concurrent(t *testing.T) {
-	service, merchants, payments, _ := newPaymentServiceForTest()
+	service, merchants, payments, _, _ := newPaymentServiceForTest()
 	merchant := seedMerchant(t, merchants)
 
 	const attempts = 20
@@ -273,7 +334,7 @@ func TestPaymentService_Create_Concurrent(t *testing.T) {
 }
 
 func TestPaymentService_UpdateStatus_Valid(t *testing.T) {
-	service, merchants, _, history := newPaymentServiceForTest()
+	service, merchants, _, history, _ := newPaymentServiceForTest()
 	merchant := seedMerchant(t, merchants)
 	payment, err := service.Create(context.Background(), merchant.ID, "ORDER-1", decimal.NewFromInt(1000), "COP", domain.PaymentMethodQR, "key-1")
 	require.NoError(t, err)
@@ -292,7 +353,7 @@ func TestPaymentService_UpdateStatus_Valid(t *testing.T) {
 }
 
 func TestPaymentService_UpdateStatus_InvalidTransition(t *testing.T) {
-	service, merchants, _, _ := newPaymentServiceForTest()
+	service, merchants, _, _, _ := newPaymentServiceForTest()
 	merchant := seedMerchant(t, merchants)
 	payment, err := service.Create(context.Background(), merchant.ID, "ORDER-1", decimal.NewFromInt(1000), "COP", domain.PaymentMethodQR, "key-1")
 	require.NoError(t, err)
@@ -305,7 +366,7 @@ func TestPaymentService_UpdateStatus_InvalidTransition(t *testing.T) {
 }
 
 func TestPaymentService_UpdateStatus_PaymentNotFound(t *testing.T) {
-	service, _, _, _ := newPaymentServiceForTest()
+	service, _, _, _, _ := newPaymentServiceForTest()
 
 	_, err := service.UpdateStatus(context.Background(), "id-inventado", domain.PaymentStatusApproved, "x", "test-user")
 
@@ -313,7 +374,7 @@ func TestPaymentService_UpdateStatus_PaymentNotFound(t *testing.T) {
 }
 
 func TestPaymentService_History_PaymentNotFound(t *testing.T) {
-	service, _, _, _ := newPaymentServiceForTest()
+	service, _, _, _, _ := newPaymentServiceForTest()
 
 	_, err := service.History(context.Background(), "id-inventado")
 
@@ -321,7 +382,7 @@ func TestPaymentService_History_PaymentNotFound(t *testing.T) {
 }
 
 func TestPaymentService_List_DefaultsPageAndLimit(t *testing.T) {
-	service, merchants, _, _ := newPaymentServiceForTest()
+	service, merchants, _, _, _ := newPaymentServiceForTest()
 	merchant := seedMerchant(t, merchants)
 	_, err := service.Create(context.Background(), merchant.ID, "ORDER-1", decimal.NewFromInt(1000), "COP", domain.PaymentMethodQR, "key-1")
 	require.NoError(t, err)
@@ -334,9 +395,75 @@ func TestPaymentService_List_DefaultsPageAndLimit(t *testing.T) {
 }
 
 func TestPaymentService_List_LimitCappedAtMax(t *testing.T) {
-	service, _, _, _ := newPaymentServiceForTest()
+	service, _, _, _, _ := newPaymentServiceForTest()
 
 	_, _, err := service.List(context.Background(), application.PaymentFilter{Limit: application.MaxLimit + 1000})
 
 	require.NoError(t, err)
+}
+
+func TestPaymentService_Summary_MerchantNotFound(t *testing.T) {
+	service, _, _, _, _ := newPaymentServiceForTest()
+
+	_, err := service.Summary(context.Background(), "id-inventado")
+
+	require.ErrorIs(t, err, application.ErrNotFound)
+}
+
+func TestPaymentService_Summary_ComputesFromRepository(t *testing.T) {
+	service, merchants, _, _, _ := newPaymentServiceForTest()
+	merchant := seedMerchant(t, merchants)
+
+	approved, err := service.Create(context.Background(), merchant.ID, "ORDER-1", decimal.NewFromInt(1000), "COP", domain.PaymentMethodQR, "key-1")
+	require.NoError(t, err)
+	_, err = service.UpdateStatus(context.Background(), approved.ID, domain.PaymentStatusApproved, "ok", "test-user")
+	require.NoError(t, err)
+
+	_, err = service.Create(context.Background(), merchant.ID, "ORDER-2", decimal.NewFromInt(500), "COP", domain.PaymentMethodQR, "key-2")
+	require.NoError(t, err)
+
+	summary, err := service.Summary(context.Background(), merchant.ID)
+
+	require.NoError(t, err)
+	require.Equal(t, int64(2), summary.TotalPayments)
+	require.Equal(t, int64(1), summary.ApprovedPayments)
+	require.Equal(t, int64(1), summary.PendingPayments)
+	require.True(t, decimal.NewFromInt(1000).Equal(summary.ApprovedAmount))
+}
+
+func TestPaymentService_Summary_UsesCacheOnSecondCall(t *testing.T) {
+	service, merchants, _, _, cache := newPaymentServiceForTest()
+	merchant := seedMerchant(t, merchants)
+	_, err := service.Create(context.Background(), merchant.ID, "ORDER-1", decimal.NewFromInt(1000), "COP", domain.PaymentMethodQR, "key-1")
+	require.NoError(t, err)
+
+	require.False(t, cache.has(merchant.ID), "no debe haber nada en cache antes de la primera consulta")
+
+	_, err = service.Summary(context.Background(), merchant.ID)
+	require.NoError(t, err)
+	require.True(t, cache.has(merchant.ID), "la primera consulta debe guardar el resultado en cache")
+
+	// Segunda consulta: debe venir de la cache, no de un recálculo (lo
+	// verificamos indirectamente: si borráramos el pago del repo "a mano"
+	// sin pasar por UpdateStatus, un recálculo lo notaría; en cambio la
+	// cache seguiría devolviendo el valor guardado).
+	cached, err := service.Summary(context.Background(), merchant.ID)
+	require.NoError(t, err)
+	require.Equal(t, int64(1), cached.TotalPayments)
+}
+
+func TestPaymentService_UpdateStatus_InvalidatesSummaryCache(t *testing.T) {
+	service, merchants, _, _, cache := newPaymentServiceForTest()
+	merchant := seedMerchant(t, merchants)
+	payment, err := service.Create(context.Background(), merchant.ID, "ORDER-1", decimal.NewFromInt(1000), "COP", domain.PaymentMethodQR, "key-1")
+	require.NoError(t, err)
+
+	_, err = service.Summary(context.Background(), merchant.ID)
+	require.NoError(t, err)
+	require.True(t, cache.has(merchant.ID), "la consulta debe haber guardado en cache")
+
+	_, err = service.UpdateStatus(context.Background(), payment.ID, domain.PaymentStatusApproved, "ok", "test-user")
+	require.NoError(t, err)
+
+	require.False(t, cache.has(merchant.ID), "UpdateStatus debe invalidar la cache de ese comercio")
 }

@@ -6,6 +6,7 @@ import (
 	"sync"
 
 	"github.com/gofiber/fiber/v2"
+	"github.com/shopspring/decimal"
 
 	"github.com/lauvale029/Prueba_tecnica_GO-Python/internal/application"
 	"github.com/lauvale029/Prueba_tecnica_GO-Python/internal/domain"
@@ -53,10 +54,10 @@ func (f *fakeMerchantRepository) GetByID(_ context.Context, id string) (*domain.
 }
 
 type fakePaymentRepository struct {
-	mu                sync.Mutex
-	byID              map[string]*domain.Payment
-	byIdempotencyKey  map[string]*domain.Payment
-	byExternalRefKey  map[string]*domain.Payment
+	mu               sync.Mutex
+	byID             map[string]*domain.Payment
+	byIdempotencyKey map[string]*domain.Payment
+	byExternalRefKey map[string]*domain.Payment
 }
 
 func newFakePaymentRepository() *fakePaymentRepository {
@@ -170,6 +171,33 @@ func (f *fakePaymentRepository) Count(_ context.Context, filter application.Paym
 	return count, nil
 }
 
+// GetSummaryByMerchantID sí calcula de verdad (a diferencia del fake de
+// internal/application, que solo necesita probar la lógica de
+// PaymentService): acá queremos probar que el endpoint HTTP devuelva
+// números reales.
+func (f *fakePaymentRepository) GetSummaryByMerchantID(_ context.Context, merchantID string) (application.MerchantSummary, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	summary := application.MerchantSummary{MerchantID: merchantID, ApprovedAmount: decimal.Zero}
+	for _, p := range f.byID {
+		if p.MerchantID != merchantID {
+			continue
+		}
+		summary.TotalPayments++
+		switch p.Status {
+		case domain.PaymentStatusApproved:
+			summary.ApprovedPayments++
+			summary.ApprovedAmount = summary.ApprovedAmount.Add(p.Amount.Amount)
+		case domain.PaymentStatusRejected:
+			summary.RejectedPayments++
+		case domain.PaymentStatusPending:
+			summary.PendingPayments++
+		}
+	}
+	return summary, nil
+}
+
 func matchesPaymentFilter(p *domain.Payment, filter application.PaymentFilter) bool {
 	if filter.MerchantID != nil && p.MerchantID != *filter.MerchantID {
 		return false
@@ -226,11 +254,11 @@ func setupApp() testApp {
 	paymentRepo := newFakePaymentRepository()
 	historyRepo := newFakeHistoryRepository()
 
-	merchantService := application.NewMerchantService(merchantRepo)
-	paymentService := application.NewPaymentService(paymentRepo, merchantRepo, historyRepo, application.NoopIdempotencyLocker{})
-
-	merchantHandler := transporthttp.NewMerchantHandler(merchantService)
+	paymentService := application.NewPaymentService(paymentRepo, merchantRepo, historyRepo, application.NoopIdempotencyLocker{}, application.NoopSummaryCache{})
 	paymentHandler := transporthttp.NewPaymentHandler(paymentService)
+
+	merchantService := application.NewMerchantService(merchantRepo)
+	merchantHandler := transporthttp.NewMerchantHandler(merchantService, paymentService)
 
 	return testApp{
 		app:       transporthttp.NewRouter(merchantHandler, paymentHandler),

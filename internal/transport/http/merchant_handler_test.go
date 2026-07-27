@@ -118,3 +118,33 @@ func TestGetMerchant_NotFound(t *testing.T) {
 	require.NoError(t, json.NewDecoder(resp.Body).Decode(&got))
 	require.Equal(t, "MERCHANT_NOT_FOUND", got["error"]["code"])
 }
+func TestGetMerchantSummary_Success(t *testing.T) {
+	ta := setupApp()
+	merchant := createTestMerchantInApp(t, ta)
+	createTestPayment(t, ta, merchant.ID, "ORDER-SUMMARY-1")
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/merchants/"+merchant.ID+"/summary", nil)
+	resp, err := ta.app.Test(req)
+	require.NoError(t, err)
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+
+	var got map[string]any
+	require.NoError(t, json.NewDecoder(resp.Body).Decode(&got))
+	require.Equal(t, merchant.ID, got["merchant_id"])
+	require.EqualValues(t, 1, got["total_payments"])
+	require.EqualValues(t, 0, got["approved_payments"])
+	require.EqualValues(t, 1, got["pending_payments"])
+}
+
+func TestGetMerchantSummary_NotFound(t *testing.T) {
+	ta := setupApp()
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/merchants/id-que-no-existe/summary", nil)
+	resp, err := ta.app.Test(req)
+	require.NoError(t, err)
+	require.Equal(t, http.StatusNotFound, resp.StatusCode)
+
+	var got map[string]map[string]string
+	require.NoError(t, json.NewDecoder(resp.Body).Decode(&got))
+	require.Equal(t, "MERCHANT_NOT_FOUND", got["error"]["code"])
+}
