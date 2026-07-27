@@ -74,8 +74,9 @@ Ver [`.env.example`](.env.example). Resumen:
 | `DB_HOST`, `DB_PORT`, `DB_USER`, `DB_PASSWORD`, `DB_NAME`, `DB_SSLMODE` | Conexión a PostgreSQL |
 | `DATABASE_URL` | Cadena de conexión completa (derivada de las anteriores) |
 | `REDIS_ADDR`, `REDIS_PASSWORD`, `REDIS_DB` | Conexión a Redis |
-| `JWT_SECRET` | Secreto para firmar/validar tokens JWT |
+| `JWT_SECRET` | Secreto para firmar/validar tokens JWT (solo lo conoce el servidor, nunca se comparte) |
 | `JWT_EXPIRATION_MINUTES` | Duración del token emitido |
+| `AUTH_USERNAME`, `AUTH_PASSWORD` | Única credencial de servicio aceptada por `POST /api/v1/auth/login` (ver sección "Autenticación") |
 
 ## Ejecución
 
@@ -160,12 +161,23 @@ según corresponda, transición de estado válida/inválida con su registro
 en el historial, que el resumen se calcule bien y use/invalide la cache
 correctamente, y (el más importante) que 20 goroutines concurrentes con
 la misma `Idempotency-Key` converjan en un solo pago — ver la sección
-"Idempotencia y concurrencia" más abajo. `internal/transport/http`
-(25 tests) prueba **todos** los endpoints de comercios y pagos
-(`POST`/`GET`/`PATCH .../status`/`GET .../history`/`GET .../summary`)
-completos con `app.Test(...)` de Fiber (request/response JSON reales,
-sin red), cubriendo los distintos códigos HTTP posibles (`201`, `200`,
-`404`, `409`, `422`, `400`). Ninguno de los dos necesita Postgres.
+"Idempotencia y concurrencia" más abajo.
+
+`internal/infrastructure/auth` (4 tests) prueba la emisión y validación
+de JWT en aislamiento: ida y vuelta con un secreto correcto, rechazo con
+secreto equivocado, rechazo por expiración, rechazo por token malformado.
+`internal/middleware` (5 tests) prueba `RequireAuth` como middleware
+Fiber genérico (sin el router real de por medio): sin header, header sin
+`Bearer`, token inválido, token expirado, token válido.
+`internal/transport/http` (32 tests) prueba **todos** los endpoints de
+comercios y pagos (`POST`/`GET`/`PATCH .../status`/`GET .../history`/
+`GET .../summary`) completos con `app.Test(...)` de Fiber (request/response
+JSON reales, sin red), cubriendo los distintos códigos HTTP posibles
+(`201`, `200`, `404`, `409`, `422`, `400`, `401`) — incluye login válido/
+credenciales incorrectas, y que las rutas reales del router (no el
+middleware aislado) devuelvan `401` sin token/con token inválido/expirado,
+y que `/auth/login` sea la única ruta pública. Ninguno de estos paquetes
+necesita Postgres.
 
 _(Se irá agregando la prueba del worker de conciliación en Python.)_
 
@@ -229,6 +241,41 @@ Dos tests de concurrencia, cada uno cubriendo un riesgo distinto:
 Ambos se corrieron repetidamente (20 y 10 veces seguidas respectivamente)
 sin un solo fallo, para descartar que fuera casualidad.
 
+## Autenticación
+
+Todas las rutas de `/api/v1` requieren un JWT válido, **excepto**
+`POST /api/v1/auth/login`.
+
+### Flujo
+
+1. `POST /api/v1/auth/login` con `{"username", "password"}` en el body.
+2. El servidor compara ambos campos, en tiempo constante
+   (`crypto/subtle.ConstantTimeCompare`, para no filtrar por diferencias
+   de tiempo de respuesta cuántos caracteres acertó un intento), contra
+   `AUTH_USERNAME`/`AUTH_PASSWORD` — la única credencial configurada, no
+   hay tabla de usuarios.
+3. Si coinciden, responde `200` con `{"token", "expires_at"}` — un JWT
+   HS256 firmado con `JWT_SECRET`, con `sub=<username>` y `exp` según
+   `JWT_EXPIRATION_MINUTES`. Si no, `401 INVALID_CREDENTIALS`.
+4. El resto de endpoints exige el header
+   `Authorization: Bearer <token>`. `internal/middleware.RequireAuth`
+   valida firma y expiración; si falla por cualquier motivo (falta el
+   header, no es `Bearer`, la firma no corresponde, expiró), responde
+   `401 UNAUTHORIZED` sin distinguir el motivo exacto al cliente. Si es
+   válido, deja el `sub` en `c.Locals` para que los handlers lo usen (ver
+   `changed_by` en Decisiones técnicas).
+
+### Por qué una sola credencial y no un sistema de usuarios
+
+El JWT sigue siendo *stateless* (no hay sesiones ni tabla de tokens
+activos: cualquier token con firma y expiración válidas se acepta) — la
+única particularidad de este proyecto es que solo existe **una**
+identidad posible detrás del token, la credencial de servicio
+(`AUTH_USERNAME`), pensada para dos consumidores controlados por quien
+despliega la API: quien la prueba manualmente (Postman/curl) y el worker
+de conciliación en Python, que hace login programáticamente al arrancar
+usando la misma credencial desde su propia configuración.
+
 ## Decisiones técnicas
 
 - **Paginación con límite por defecto, nunca "todo" por defecto:**
@@ -240,12 +287,13 @@ sin un solo fallo, para descartar que fuera casualidad.
   de una sola vez; el comportamiento por defecto de una API debe ser el
   seguro, no el más costoso. Quien necesite explorar más allá del límite
   usa `page` para paginar.
-- **`changed_by` es un placeholder hasta la Fase 7:** `PATCH .../status`
-  registra en el historial quién hizo el cambio, pero como la
-  autenticación (JWT) todavía no existe, `transport/http` usa una función
-  `changedBy(c)` que hoy siempre devuelve `"system"` — está aislada en un
-  solo lugar a propósito, para reemplazarla por el subject del token sin
-  tocar `PaymentService` ni el resto del flujo.
+- **`changed_by` usa el subject del JWT:** `PATCH .../status` registra en
+  el historial quién hizo el cambio. `transport/http.changedBy(c)` lee el
+  subject que `middleware.RequireAuth` deja en `c.Locals` tras validar el
+  token — como solo existe una credencial de servicio, el valor siempre es
+  `"mova-service"` (o el `AUTH_USERNAME` configurado), pero queda aislado
+  en una sola función a propósito: si en el futuro existiera un sistema
+  de usuarios real, solo cambiaría esta función, no `PaymentService`.
 - **Código de error `INVALID_PAYMENT_STATUS` para transición inválida:**
   se usa ese código exacto (no uno inventado) porque es literalmente el
   ejemplo que trae la sección 6.3 del documento base para este caso,
@@ -349,7 +397,18 @@ sin un solo fallo, para descartar que fuera casualidad.
     en Postgres — sin paso por binario, sin error de redondeo. El costo
     (aritmética un poco más lenta que con floats nativos) es irrelevante
     para el volumen de este sistema.
-- **Autenticación:** JWT.
+- **Autenticación — por qué una sola credencial de servicio y no un
+  sistema de usuarios:** el documento base pide "algún mecanismo de
+  autenticación", sin exigir registro/roles/multiusuario. Implementar una
+  tabla `users` completa (con hashing de contraseñas, gestión de cuentas,
+  etc.) sería resolver un problema que el enunciado no plantea. En su
+  lugar, `AUTH_USERNAME`/`AUTH_PASSWORD` (config, no base de datos) son la
+  única credencial válida para `POST /api/v1/auth/login`; quien la
+  presenta recibe un JWT (HS256, `sub`=username, `exp` según
+  `JWT_EXPIRATION_MINUTES`) que debe enviarse como
+  `Authorization: Bearer <token>` en el resto de endpoints de
+  `/api/v1` — ver sección "Autenticación" más abajo para el detalle
+  completo del flujo.
 - **Redis:** usado para (1) lock rápido de idempotencia en la creación de
   pagos (ver sección "Idempotencia y concurrencia") y (2) cache del
   endpoint de resumen por comercio (`GET /merchants/{id}/summary`),
