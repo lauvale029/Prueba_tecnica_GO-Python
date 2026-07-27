@@ -1,0 +1,379 @@
+openapi: 3.0.3
+info:
+  title: MOVA · API de procesamiento de pagos
+  description: >
+    API de pagos para comercios: registro, consulta, transición de estado con
+    trazabilidad, y resumen agregado por comercio. Ver README.md del
+    repositorio para el detalle de arquitectura, decisiones técnicas e
+    idempotencia/concurrencia.
+  version: "1.0.0"
+servers:
+  - url: http://localhost:8080/api/v1
+    description: Local (docker compose up)
+
+tags:
+  - name: auth
+  - name: merchants
+  - name: payments
+
+security:
+  - bearerAuth: []
+
+paths:
+  /auth/login:
+    post:
+      tags: [auth]
+      summary: Autenticarse con la credencial de servicio configurada
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [username, password]
+              properties:
+                username: { type: string, example: mova-service }
+                password: { type: string, format: password }
+      responses:
+        "200":
+          description: Login exitoso
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  token: { type: string }
+                  expires_at: { type: string, format: date-time }
+        "400": { $ref: "#/components/responses/InvalidBody" }
+        "401":
+          description: Credenciales incorrectas
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  /merchants:
+    post:
+      tags: [merchants]
+      summary: Registrar un comercio
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name, document_number, email]
+              properties:
+                name: { type: string, example: Comercio Demo }
+                document_number: { type: string, example: "900123456" }
+                email: { type: string, format: email }
+      responses:
+        "201":
+          description: Comercio creado
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Merchant" }
+        "400": { $ref: "#/components/responses/InvalidBody" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "409":
+          description: Ya existe un comercio con ese document_number
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "422": { $ref: "#/components/responses/ValidationError" }
+
+  /merchants/{merchant_id}:
+    get:
+      tags: [merchants]
+      summary: Consultar un comercio por ID
+      parameters:
+        - $ref: "#/components/parameters/MerchantId"
+      responses:
+        "200":
+          description: Comercio encontrado
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Merchant" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/MerchantNotFound" }
+
+  /merchants/{merchant_id}/summary:
+    get:
+      tags: [merchants]
+      summary: Resumen agregado de pagos de un comercio
+      description: >
+        Respuesta cacheada en Redis por 30s, invalidada al cambiar el estado
+        de cualquier pago del comercio (ver README, sección Idempotencia y
+        concurrencia / Decisiones técnicas — uso de Redis).
+      parameters:
+        - $ref: "#/components/parameters/MerchantId"
+      responses:
+        "200":
+          description: Resumen calculado
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/MerchantSummary" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/MerchantNotFound" }
+
+  /payments:
+    post:
+      tags: [payments]
+      summary: Crear un pago (idempotente)
+      description: >
+        Requiere el header Idempotency-Key, generado por el cliente. Una
+        segunda petición con la misma key devuelve el pago original en vez
+        de crear uno nuevo (ver README, sección Idempotencia y concurrencia).
+      parameters:
+        - name: Idempotency-Key
+          in: header
+          required: true
+          schema: { type: string, format: uuid }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [merchant_id, external_reference, amount, currency, payment_method]
+              properties:
+                merchant_id: { type: string, format: uuid }
+                external_reference: { type: string, example: order-12345 }
+                amount: { type: number, example: 150000 }
+                currency: { type: string, enum: [COP] }
+                payment_method:
+                  type: string
+                  enum: [CARD, QR, NFC, TRANSFER]
+      responses:
+        "201":
+          description: Pago creado (o devuelto, si la Idempotency-Key ya existía)
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Payment" }
+        "400": { $ref: "#/components/responses/InvalidBody" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/MerchantNotFound" }
+        "409":
+          description: external_reference duplicado para ese comercio
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "422": { $ref: "#/components/responses/ValidationError" }
+
+    get:
+      tags: [payments]
+      summary: Listar pagos con filtros y paginación
+      parameters:
+        - name: merchant_id
+          in: query
+          schema: { type: string, format: uuid }
+        - name: status
+          in: query
+          schema: { type: string, enum: [PENDING, APPROVED, REJECTED, CANCELLED] }
+        - name: payment_method
+          in: query
+          schema: { type: string, enum: [CARD, QR, NFC, TRANSFER] }
+        - name: date_from
+          in: query
+          description: RFC3339, ej. 2026-01-01T00:00:00Z
+          schema: { type: string, format: date-time }
+        - name: date_to
+          in: query
+          schema: { type: string, format: date-time }
+        - name: page
+          in: query
+          description: Por defecto 1
+          schema: { type: integer, minimum: 1 }
+        - name: limit
+          in: query
+          description: Por defecto 100, tope máximo 100
+          schema: { type: integer, minimum: 1 }
+      responses:
+        "200":
+          description: Listado paginado
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: array
+                    items: { $ref: "#/components/schemas/Payment" }
+                  page: { type: integer }
+                  limit: { type: integer }
+                  total: { type: integer, format: int64 }
+        "400":
+          description: Parámetro de query inválido
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+
+  /payments/{payment_id}:
+    get:
+      tags: [payments]
+      summary: Consultar un pago por ID
+      parameters:
+        - $ref: "#/components/parameters/PaymentId"
+      responses:
+        "200":
+          description: Pago encontrado
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Payment" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/PaymentNotFound" }
+
+  /payments/{payment_id}/status:
+    patch:
+      tags: [payments]
+      summary: Cambiar el estado de un pago
+      description: >
+        Solo se permiten las transiciones PENDING→APPROVED, PENDING→REJECTED
+        y PENDING→CANCELLED (ver README). Registra una entrada en el
+        historial con changed_by tomado del subject del JWT.
+      parameters:
+        - $ref: "#/components/parameters/PaymentId"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [status]
+              properties:
+                status: { type: string, enum: [APPROVED, REJECTED, CANCELLED] }
+                reason: { type: string, example: aprobado por el adquirente }
+      responses:
+        "200":
+          description: Estado actualizado
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Payment" }
+        "400": { $ref: "#/components/responses/InvalidBody" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/PaymentNotFound" }
+        "409":
+          description: Transición de estado no permitida (INVALID_PAYMENT_STATUS)
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "422": { $ref: "#/components/responses/ValidationError" }
+
+  /payments/{payment_id}/history:
+    get:
+      tags: [payments]
+      summary: Historial de cambios de estado de un pago
+      parameters:
+        - $ref: "#/components/parameters/PaymentId"
+      responses:
+        "200":
+          description: Historial ordenado
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: "#/components/schemas/PaymentStatusHistoryEntry" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/PaymentNotFound" }
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+
+  parameters:
+    MerchantId:
+      name: merchant_id
+      in: path
+      required: true
+      schema: { type: string, format: uuid }
+    PaymentId:
+      name: payment_id
+      in: path
+      required: true
+      schema: { type: string, format: uuid }
+
+  responses:
+    InvalidBody:
+      description: El cuerpo de la petición no es un JSON válido
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    ValidationError:
+      description: Falló una validación de negocio (VALIDATION_ERROR)
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    Unauthorized:
+      description: Falta el token, es inválido, o expiró
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    MerchantNotFound:
+      description: El comercio no existe
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    PaymentNotFound:
+      description: El pago no existe
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+
+  schemas:
+    Error:
+      type: object
+      properties:
+        error:
+          type: object
+          properties:
+            code: { type: string, example: VALIDATION_ERROR }
+            message: { type: string }
+
+    Merchant:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        name: { type: string }
+        document_number: { type: string }
+        email: { type: string }
+        status: { type: string, enum: [ACTIVE, INACTIVE] }
+        created_at: { type: string, format: date-time }
+        updated_at: { type: string, format: date-time }
+
+    MerchantSummary:
+      type: object
+      properties:
+        merchant_id: { type: string, format: uuid }
+        total_payments: { type: integer, format: int64 }
+        approved_payments: { type: integer, format: int64 }
+        rejected_payments: { type: integer, format: int64 }
+        pending_payments: { type: integer, format: int64 }
+        approved_amount: { type: number, example: 150000 }
+
+    Payment:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        merchant_id: { type: string, format: uuid }
+        external_reference: { type: string }
+        amount: { type: number, example: 150000 }
+        currency: { type: string, example: COP }
+        payment_method: { type: string, enum: [CARD, QR, NFC, TRANSFER] }
+        status: { type: string, enum: [PENDING, APPROVED, REJECTED, CANCELLED] }
+        created_at: { type: string, format: date-time }
+        updated_at: { type: string, format: date-time }
+
+    PaymentStatusHistoryEntry:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        payment_id: { type: string, format: uuid }
+        previous_status: { type: string, enum: [PENDING, APPROVED, REJECTED, CANCELLED] }
+        new_status: { type: string, enum: [PENDING, APPROVED, REJECTED, CANCELLED] }
+        reason: { type: string }
+        changed_by: { type: string, example: mova-service }
+        created_at: { type: string, format: date-time }

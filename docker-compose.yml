@@ -5,6 +5,20 @@ services:
       dockerfile: Dockerfile
     env_file:
       - .env
+    environment:
+      # .env trae DATABASE_URL/REDIS_ADDR apuntando a localhost:${DB_PORT}
+      # para que herramientas del host (tests de integración, clientes SQL)
+      # lleguen al puerto remapeado. Dentro de la red de Docker "localhost"
+      # es el propio contenedor api, no el de postgres/redis — por eso acá
+      # se sobrescriben con el nombre del servicio y el puerto interno.
+      DATABASE_URL: postgres://${DB_USER:-mova}:${DB_PASSWORD:-mova}@postgres:5432/${DB_NAME:-mova_payments}?sslmode=${DB_SSLMODE:-disable}
+      REDIS_ADDR: redis:6379
+      # PORT en .env controla el lado "host" del mapeo de abajo (para que
+      # tú elijas el puerto libre en tu máquina); el contenedor siempre
+      # debe escuchar internamente en 8080, sin importar ese valor — si no
+      # se fija acá, el proceso adentro también leería el PORT de .env vía
+      # env_file y quedaría escuchando en un puerto distinto al publicado.
+      PORT: "8080"
     ports:
       - "${PORT:-8080}:8080"
     depends_on:
@@ -37,6 +51,17 @@ services:
     image: redis:7-alpine
     ports:
       - "6379:6379"
+    networks:
+      - mova
+
+  swagger-ui:
+    image: swaggerapi/swagger-ui
+    environment:
+      SWAGGER_JSON: /spec/openapi.yaml
+    volumes:
+      - ./docs/openapi.yaml:/spec/openapi.yaml:ro
+    ports:
+      - "${SWAGGER_PORT:-8081}:8080"
     networks:
       - mova
 
