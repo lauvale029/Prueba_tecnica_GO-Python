@@ -79,7 +79,8 @@ Ver [`.env.example`](.env.example). Resumen:
 | `REDIS_ADDR`, `REDIS_PASSWORD`, `REDIS_DB` | Conexión a Redis |
 | `JWT_SECRET` | Secreto para firmar/validar tokens JWT (solo lo conoce el servidor, nunca se comparte) |
 | `JWT_EXPIRATION_MINUTES` | Duración del token emitido |
-| `AUTH_USERNAME`, `AUTH_PASSWORD` | Única credencial de servicio aceptada por `POST /api/v1/auth/login` (ver sección "Autenticación") |
+| `AUTH_USERNAME`, `AUTH_PASSWORD` | Única credencial de servicio aceptada por `POST /api/v1/auth/login` (ver sección "Autenticación"); también las usa el worker de Python |
+| `API_BASE_URL`, `RECONCILIATION_THRESHOLD_MINUTES` | Solo para el worker de conciliación en Python (ver esa sección) |
 
 ## Ejecución
 
@@ -195,7 +196,9 @@ middleware aislado) devuelvan `401` sin token/con token inválido/expirado,
 y que `/auth/login` sea la única ruta pública. Ninguno de estos paquetes
 necesita Postgres.
 
-_(Se irá agregando la prueba del worker de conciliación en Python.)_
+El worker de conciliación en Python (`reconciliation/`) tiene su propia
+suite, independiente de `go test` — ver la sección "Worker de
+conciliación (Python)" más abajo.
 
 ## Idempotencia y concurrencia
 
@@ -291,6 +294,94 @@ identidad posible detrás del token, la credencial de servicio
 despliega la API: quien la prueba manualmente (Postman/curl) y el worker
 de conciliación en Python, que hace login programáticamente al arrancar
 usando la misma credencial desde su propia configuración.
+
+## Worker de conciliación (Python)
+
+Proceso independiente, en `reconciliation/`, que **nunca toca la base de
+datos directamente** — todo pasa por la API de Go, tal como exige el
+enunciado. Es una sola pasada (no un loop continuo): se ejecuta, hace su
+trabajo, imprime el resumen y termina; para correrlo periódicamente se
+agenda externamente (cron, Task Scheduler, o similar).
+
+### Instalación y ejecución
+
+```bash
+cd reconciliation
+python -m venv .venv
+
+# Windows
+.venv\Scripts\activate
+# Linux/Mac
+source .venv/bin/activate
+
+pip install -r requirements.txt
+python reconciliation_worker.py
+```
+
+Lee la configuración del `.env` de la raíz del repo (no tiene uno propio):
+reutiliza `AUTH_USERNAME`/`AUTH_PASSWORD` — la misma credencial de
+servicio que usa la API, ver "Autenticación" — más dos variables nuevas,
+`API_BASE_URL` (la URL de la API tal como la ve el worker, ej.
+`http://localhost:8080`) y `RECONCILIATION_THRESHOLD_MINUTES` (opcional,
+por defecto `30`).
+
+### Qué hace, paso a paso
+
+1. Login contra `POST /auth/login` (`client.py`).
+2. Lista **todos** los pagos `PENDING`, recorriendo la paginación de
+   `GET /payments` hasta agotar el `total` reportado (un comercio con más
+   de 100 pagos pendientes no se corta a la primera página).
+3. Filtra los que llevan más de `RECONCILIATION_THRESHOLD_MINUTES` desde
+   su `created_at` (`filter_stale_payments`, función pura, sin HTTP).
+4. Para cada uno, llama `PATCH /payments/{id}/status` con
+   `status=REJECTED`. Si esa llamada falla (red o respuesta no exitosa),
+   lo cuenta como fallido y **sigue con el resto** — un pago que no se
+   pudo reconciliar no debe frenar a los demás.
+5. Imprime el resumen exacto que pide el enunciado:
+   ```
+   Payments found: 5
+   Payments reconciled: 4
+   Payments failed: 1
+   ```
+
+Un fallo al autenticarse o al listar pagos pendientes sí es fatal (sin
+eso no hay nada que hacer): imprime el error y termina con código de
+salida `1`.
+
+### Pruebas
+
+```bash
+cd reconciliation
+pip install -r requirements-dev.txt
+pytest -v
+```
+
+21 tests con `pytest` + `requests-mock` (la API de Go nunca corre de
+verdad en estos tests):
+
+- `test_config.py` (7): lectura de variables requeridas, default del
+  umbral, error si falta alguna variable o si el umbral no es un entero.
+- `test_client.py` (7): login exitoso/credenciales inválidas/error de
+  red, paginación de `list_pending_payments` (una página y varias),
+  `reject_payment` exitoso y con error del servidor.
+- `test_reconciliation_worker.py` (5): la regla pura de "más de N
+  minutos" (incluye el caso límite exactamente en el umbral), y `run()`
+  con un cliente falso — reconciliación exitosa, un fallo que no detiene
+  a los demás, y el caso sin nada que reconciliar.
+- `test_main.py` (2): el flujo completo de `main()` con la API
+  completamente mockeada (login, listado paginado, un rechazo que falla
+  entre varios que sí funcionan) verificando el resumen impreso exacto, y
+  que un fallo de login termine el proceso con código `1`.
+
+Verificado también en vivo contra la API real en Docker: se creó un pago
+`PENDING`, se corrió el worker con `RECONCILIATION_THRESHOLD_MINUTES=0`
+(para no esperar 30 minutos de verdad) y se confirmó en
+`GET /payments/{id}/history` que quedó `REJECTED` con
+`changed_by: "mova-service"` — la misma credencial de servicio, porque el
+worker se autentica igual que cualquier otro consumidor de la API. También
+se probó con la API caída, confirmando que el mensaje de error de red es
+claro y el proceso termina con código `1` en vez de quedar colgado o
+fallar con un traceback críptico.
 
 ## Decisiones técnicas
 
@@ -435,6 +526,19 @@ usando la misma credencial desde su propia configuración.
   nunca la fuente de verdad — si no está configurado o falla, el sistema
   sigue siendo correcto (`NoopIdempotencyLocker`/`NoopSummaryCache`),
   solo un poco más lento.
+- **Worker de Python — por qué una sola pasada y no un loop continuo:**
+  el enunciado lo ilustra como `python reconciliation_worker.py`, una
+  invocación puntual con un resumen impreso al final — no como un
+  servicio de larga duración. Una sola pasada es además más fácil de
+  probar de forma determinista (sin manejar señales ni temporizadores) y
+  más simple de operar: se agenda con las herramientas que ya existen
+  para eso (cron, Task Scheduler), en vez de reinventar un scheduler
+  propio dentro del script.
+- **El worker nunca toca Postgres directamente:** todo pasa por la API
+  de Go (`client.py` solo hace peticiones HTTP) — cumple la restricción
+  explícita del enunciado, y de paso mantiene una sola fuente de verdad
+  para las reglas de negocio (transición de estados, idempotencia): el
+  worker no necesita — ni puede — saltárselas.
 
 _(Se irán agregando las decisiones puntuales de cada fase, con su
 justificación.)_
