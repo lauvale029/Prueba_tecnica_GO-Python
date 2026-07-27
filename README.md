@@ -13,8 +13,10 @@ condiciones de carrera bajo solicitudes concurrentes. Un proceso independiente
 en Python concilia periódicamente los pagos `PENDING` con más de 30 minutos,
 marcándolos como `REJECTED` a través de la propia API.
 
-_(Esta sección se irá ampliando a medida que se implementen las reglas de
-negocio — fases en curso, ver historial de commits.)_
+Toda la API queda detrás de autenticación JWT (ver sección "Autenticación"),
+con idempotencia garantizada a nivel de base de datos para la creación de
+pagos, y un resumen por comercio cacheado en Redis con invalidación explícita
+ante cualquier cambio de estado.
 
 ## Arquitectura
 
@@ -28,10 +30,10 @@ internal/
     postgres/              # implementación de repositorios (sqlc + pgx)
     redis/                  # idempotencia rápida y cache del resumen
   transport/http/          # handlers Fiber, DTOs de request/response
-  middleware/              # auth JWT, logging, recuperación de panics
+  middleware/              # RequireAuth: validación de JWT en rutas protegidas
 migrations/               # migraciones SQL versionadas
 reconciliation/           # worker de conciliación en Python (cliente + script)
-tests/                    # pruebas de integración transversales
+docs/                     # especificación OpenAPI
 scripts/                  # utilidades de desarrollo
 ```
 
@@ -71,6 +73,7 @@ Ver [`.env.example`](.env.example). Resumen:
 | Variable | Descripción |
 |---|---|
 | `PORT` | Puerto HTTP de la API |
+| `SWAGGER_PORT` | Puerto de Swagger UI (documentación interactiva), por defecto `8081` |
 | `DB_HOST`, `DB_PORT`, `DB_USER`, `DB_PASSWORD`, `DB_NAME`, `DB_SSLMODE` | Conexión a PostgreSQL |
 | `DATABASE_URL` | Cadena de conexión completa (derivada de las anteriores) |
 | `REDIS_ADDR`, `REDIS_PASSWORD`, `REDIS_DB` | Conexión a Redis |
@@ -95,6 +98,19 @@ go run ./cmd/api
 
 Lee `PORT` y `DATABASE_URL` de tu `.env` (vía `godotenv`) o de variables de
 entorno ya exportadas; `PORT` por defecto es `8080` si no se define.
+
+## Documentación de la API
+
+La especificación completa de todos los endpoints (comercios, pagos,
+autenticación) está en [`docs/openapi.yaml`](docs/openapi.yaml) (OpenAPI
+3.0): parámetros, request/response bodies, y todos los códigos de error
+posibles por endpoint.
+
+`docker compose up` levanta también una instancia de Swagger UI ya
+apuntando a ese archivo — con todo corriendo, ábrela directamente en
+`http://localhost:8081` (puerto configurable con `SWAGGER_PORT` en tu
+`.env`) para explorarla de forma interactiva, sin copiar/pegar nada en
+ningún sitio externo.
 
 ## Migraciones
 
@@ -322,7 +338,7 @@ usando la misma credencial desde su propia configuración.
     vivían en `internal/infrastructure/postgres`, porque solo
     `transport/http` necesitaba reconocerlos — una capa "de arriba"
     conociendo detalles de una "de abajo" no rompe la regla. Eso cambió
-    en la Fase 4: `PaymentService` (en `application`, la capa
+    en el proceso de desarrollo: `PaymentService` (en `application`, la capa
     *intermedia*) necesita inspeccionar estos errores para decidir si
     hacer replay de idempotencia o reintentar una creación de pago. Si
     siguieran en `postgres`, `application` terminaría dependiendo de
@@ -457,5 +473,17 @@ decidir, asumimos:
   el host (tests de integración, clientes SQL); las conexiones entre
   contenedores (`scripts/migrate.sh`, la API corriendo en Docker) siempre
   usan el puerto interno `5432` y no se ven afectadas.
-- _(Se irán agregando más limitaciones conforme surjan en fases
-  posteriores.)_
+- **Puerto de la API configurable por el mismo motivo:** si en tu máquina
+  ya hay otro proceso escuchando en `8080`, cambia `PORT` en tu `.env` a uno libre
+  (ej. `18080`) — `docker-compose.yml` ya usa `${PORT:-8080}` para el
+  mapeo del contenedor `api`, no requiere tocar código.
+- **`docker-compose.yml` separa el `DATABASE_URL`/`REDIS_ADDR` del
+  contenedor `api` de los que usa tu `.env`:** el `.env` usa
+  `localhost:${DB_PORT}` porque así lo necesitan las herramientas que
+  corren en tu máquina (tests de integración, `scripts/migrate.sh`); pero
+  dentro de la red de Docker, "localhost" es el propio contenedor `api`,
+  no el de Postgres/Redis. Por eso `docker-compose.yml` sobrescribe esas
+  dos variables solo para el servicio `api`, apuntándolas al nombre del
+  servicio (`postgres:5432`, `redis:6379`) — la única forma de que
+  `docker compose up --build` funcione de punta a punta sin pasos
+  manuales adicionales.
