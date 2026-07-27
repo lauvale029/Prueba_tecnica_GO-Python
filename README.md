@@ -1,7 +1,6 @@
 # MOVA · API de procesamiento de pagos (Go + Python)
 
-Prueba técnica Backend — pista Go + Python. API de pagos desarrollada en Go
-(75% de la calificación) más un proceso de conciliación en Python (25%) que
+Prueba técnica Backend — pista Go + Python. API de pagos desarrollada en Go más un proceso de conciliación en Python que
 consume dicha API.
 
 ## Descripción
@@ -261,7 +260,7 @@ Esto levanta la API, PostgreSQL y Redis. La API queda disponible en
 go run ./cmd/api
 ```
 
-Lee `PORT` y `DATABASE_URL` de tu `.env` (vía `godotenv`) o de variables de
+Lee `PORT` y `DATABASE_URL` del `.env` (vía `godotenv`) o de variables de
 entorno ya exportadas; `PORT` por defecto es `8080` si no se define.
 
 ## Documentación de la API
@@ -273,7 +272,7 @@ posibles por endpoint.
 
 `docker compose up` levanta también una instancia de Swagger UI ya
 apuntando a ese archivo — con todo corriendo, ábrela directamente en
-`http://localhost:8081` (puerto configurable con `SWAGGER_PORT` en tu
+`http://localhost:8081` (puerto configurable con `SWAGGER_PORT` en el
 `.env`) para explorarla de forma interactiva, sin copiar/pegar nada en
 ningún sitio externo.
 
@@ -286,7 +285,7 @@ esquema inicial: `merchants`, `payments`, `payment_status_history`; su
 [`golang-migrate`](https://github.com/golang-migrate/migrate) a través de su
 imagen Docker oficial, sin necesidad de instalar nada localmente.
 
-Con Postgres ya levantado (`docker compose up -d postgres`) y tu `.env`
+Con Postgres ya levantado (`docker compose up -d postgres`) y el `.env`
 completo:
 
 ```bash
@@ -703,9 +702,6 @@ fallar con un traceback críptico.
   explícita del enunciado, y de paso mantiene una sola fuente de verdad
   para las reglas de negocio (transición de estados, idempotencia): el
   worker no necesita — ni puede — saltárselas.
-
-_(Se irán agregando las decisiones puntuales de cada fase, con su
-justificación.)_
 
 ## Supuestos
 
