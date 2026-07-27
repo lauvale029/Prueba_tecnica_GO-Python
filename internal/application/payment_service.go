@@ -33,10 +33,11 @@ type PaymentService struct {
 	merchants MerchantRepository
 	history   PaymentStatusHistoryRepository
 	locker    IdempotencyLocker
+	summaries SummaryCache
 }
 
-func NewPaymentService(payments PaymentRepository, merchants MerchantRepository, history PaymentStatusHistoryRepository, locker IdempotencyLocker) *PaymentService {
-	return &PaymentService{payments: payments, merchants: merchants, history: history, locker: locker}
+func NewPaymentService(payments PaymentRepository, merchants MerchantRepository, history PaymentStatusHistoryRepository, locker IdempotencyLocker, summaries SummaryCache) *PaymentService {
+	return &PaymentService{payments: payments, merchants: merchants, history: history, locker: locker, summaries: summaries}
 }
 
 // Create crea un pago nuevo, o devuelve el pago ya existente si
@@ -168,6 +169,11 @@ func (s *PaymentService) UpdateStatus(ctx context.Context, paymentID string, new
 		return nil, err
 	}
 
+	// El resumen del comercio (total/aprobados/rechazados/pendientes/monto)
+	// acaba de cambiar; invalidamos la cache para que la próxima consulta
+	// recalcule con datos frescos en vez de esperar a que expire el TTL.
+	s.summaries.Invalidate(ctx, payment.MerchantID)
+
 	return payment, nil
 }
 
@@ -179,4 +185,25 @@ func (s *PaymentService) History(ctx context.Context, paymentID string) ([]*doma
 		return nil, err
 	}
 	return s.history.ListByPaymentID(ctx, paymentID)
+}
+
+// Summary calcula (o recupera de cache) el resumen de movimientos de un
+// comercio. Verifica primero que el comercio exista, para responder 404
+// en vez de un resumen vacío si el ID no existe.
+func (s *PaymentService) Summary(ctx context.Context, merchantID string) (*MerchantSummary, error) {
+	if _, err := s.merchants.GetByID(ctx, merchantID); err != nil {
+		return nil, err
+	}
+
+	if cached, ok := s.summaries.Get(ctx, merchantID); ok {
+		return &cached, nil
+	}
+
+	summary, err := s.payments.GetSummaryByMerchantID(ctx, merchantID)
+	if err != nil {
+		return nil, err
+	}
+
+	s.summaries.Set(ctx, merchantID, summary)
+	return &summary, nil
 }
