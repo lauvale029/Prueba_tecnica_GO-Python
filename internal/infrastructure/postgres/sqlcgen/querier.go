@@ -14,6 +14,7 @@ type Querier interface {
 	CreatePayment(ctx context.Context, arg CreatePaymentParams) (Payment, error)
 	CreatePaymentStatusHistory(ctx context.Context, arg CreatePaymentStatusHistoryParams) (PaymentStatusHistory, error)
 	GetMerchantByID(ctx context.Context, id string) (Merchant, error)
+	GetMerchantSummary(ctx context.Context, merchantID string) (GetMerchantSummaryRow, error)
 	GetPaymentByID(ctx context.Context, id string) (Payment, error)
 	GetPaymentByIdempotencyKey(ctx context.Context, idempotencyKey string) (Payment, error)
 	GetPaymentByMerchantAndExternalReference(ctx context.Context, arg GetPaymentByMerchantAndExternalReferenceParams) (Payment, error)

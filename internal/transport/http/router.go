@@ -10,6 +10,7 @@ func NewRouter(merchantHandler *MerchantHandler, paymentHandler *PaymentHandler)
 
 	v1.Post("/merchants", merchantHandler.Create)
 	v1.Get("/merchants/:merchant_id", merchantHandler.Get)
+	v1.Get("/merchants/:merchant_id/summary", merchantHandler.Summary)
 
 	v1.Post("/payments", paymentHandler.Create)
 	v1.Get("/payments", paymentHandler.List)

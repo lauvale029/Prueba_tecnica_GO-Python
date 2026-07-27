@@ -23,22 +23,24 @@ func main() {
 	defer db.Close()
 
 	var locker application.IdempotencyLocker = application.NoopIdempotencyLocker{}
+	var summaryCache application.SummaryCache = application.NoopSummaryCache{}
 	if cfg.RedisAddr != "" {
 		redisClient := redisinfra.NewClient(cfg.RedisAddr, cfg.RedisPassword, cfg.RedisDB)
 		locker = redisinfra.NewIdempotencyLocker(redisClient)
-		log.Printf("idempotency lock: usando Redis en %s", cfg.RedisAddr)
+		summaryCache = redisinfra.NewSummaryCache(redisClient)
+		log.Printf("idempotency lock + summary cache: usando Redis en %s", cfg.RedisAddr)
 	} else {
-		log.Println("idempotency lock: REDIS_ADDR no configurado, usando solo la restricción única de Postgres")
+		log.Println("Redis no configurado (REDIS_ADDR vacío): sin lock de idempotencia ni cache de resumen")
 	}
 
 	merchantRepo := postgres.NewMerchantRepository(db)
-	merchantService := application.NewMerchantService(merchantRepo)
-	merchantHandler := transporthttp.NewMerchantHandler(merchantService)
-
 	paymentRepo := postgres.NewPaymentRepository(db)
 	paymentHistoryRepo := postgres.NewPaymentStatusHistoryRepository(db)
-	paymentService := application.NewPaymentService(paymentRepo, merchantRepo, paymentHistoryRepo, locker)
+	paymentService := application.NewPaymentService(paymentRepo, merchantRepo, paymentHistoryRepo, locker, summaryCache)
 	paymentHandler := transporthttp.NewPaymentHandler(paymentService)
+
+	merchantService := application.NewMerchantService(merchantRepo)
+	merchantHandler := transporthttp.NewMerchantHandler(merchantService, paymentService)
 
 	app := transporthttp.NewRouter(merchantHandler, paymentHandler)
 

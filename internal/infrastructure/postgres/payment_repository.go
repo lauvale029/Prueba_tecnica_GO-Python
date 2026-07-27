@@ -121,6 +121,22 @@ func (r *PaymentRepository) Count(ctx context.Context, filter application.Paymen
 	return count, nil
 }
 
+func (r *PaymentRepository) GetSummaryByMerchantID(ctx context.Context, merchantID string) (application.MerchantSummary, error) {
+	row, err := r.queries.GetMerchantSummary(ctx, merchantID)
+	if err != nil {
+		return application.MerchantSummary{}, mapError(err)
+	}
+
+	return application.MerchantSummary{
+		MerchantID:       merchantID,
+		TotalPayments:    row.TotalPayments,
+		ApprovedPayments: row.ApprovedPayments,
+		RejectedPayments: row.RejectedPayments,
+		PendingPayments:  row.PendingPayments,
+		ApprovedAmount:   row.ApprovedAmount,
+	}, nil
+}
+
 // nullableUUID convierte un *string opcional a uuid.NullUUID, el tipo que
 // sqlc genera para un parámetro de tipo uuid que puede ser NULL (ver
 // ListPaymentsParams/CountPaymentsParams en sqlcgen).

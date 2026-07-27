@@ -153,18 +153,19 @@ paginación** (por comercio, por estado, con `page`/`limit`), y la
 concurrencia real de 20 goroutines contra Postgres con la misma
 `Idempotency-Key`.
 
-`internal/application` (17 tests) prueba `MerchantService` y
+`internal/application` (21 tests) prueba `MerchantService` y
 `PaymentService` con repositorios falsos en memoria: que el dominio
 valide antes de persistir, que los errores se propaguen o se resuelvan
 según corresponda, transición de estado válida/inválida con su registro
-en el historial, y (el más importante) que 20 goroutines concurrentes
-con la misma `Idempotency-Key` converjan en un solo pago — ver la
-sección "Idempotencia y concurrencia" más abajo. `internal/transport/http`
-(23 tests) prueba **todos** los endpoints de comercios y pagos
-(`POST`/`GET`/`PATCH .../status`/`GET .../history`) completos con
-`app.Test(...)` de Fiber (request/response JSON reales, sin red),
-cubriendo los distintos códigos HTTP posibles (`201`, `200`, `404`,
-`409`, `422`, `400`). Ninguno de los dos necesita Postgres.
+en el historial, que el resumen se calcule bien y use/invalide la cache
+correctamente, y (el más importante) que 20 goroutines concurrentes con
+la misma `Idempotency-Key` converjan en un solo pago — ver la sección
+"Idempotencia y concurrencia" más abajo. `internal/transport/http`
+(25 tests) prueba **todos** los endpoints de comercios y pagos
+(`POST`/`GET`/`PATCH .../status`/`GET .../history`/`GET .../summary`)
+completos con `app.Test(...)` de Fiber (request/response JSON reales,
+sin red), cubriendo los distintos códigos HTTP posibles (`201`, `200`,
+`404`, `409`, `422`, `400`). Ninguno de los dos necesita Postgres.
 
 _(Se irá agregando la prueba del worker de conciliación en Python.)_
 
@@ -325,6 +326,13 @@ sin un solo fallo, para descartar que fuera casualidad.
     `decimal.Decimal` (ver punto de Dinero abajo), el override en
     `sqlc.yaml` debe usar `db_type: "pg_catalog.numeric"` — el nombre
     corto `"numeric"` no lo reconoce y la columna queda como `string`.
+  - Segunda nota, misma causa raíz: en una **expresión calculada** (ej.
+    `COALESCE(sum(amount) FILTER (...), 0)` del resumen por comercio),
+    `sqlc` no puede inferir el tipo solo — sin un cast explícito
+    (`::numeric`), el campo generado queda como `interface{}` en vez de
+    `decimal.Decimal`. El override solo ayuda cuando `sqlc` ya sabe que
+    está mirando una columna `NUMERIC`; una expresión hay que
+    "etiquetarla" a mano.
 - **Dinero — por qué `decimal.Decimal` y no `float64`:** columnas
   `NUMERIC` en PostgreSQL mapeadas a `shopspring/decimal` en Go.
   - Los `float64` usan coma flotante binaria (IEEE 754): la mayoría de
@@ -342,11 +350,16 @@ sin un solo fallo, para descartar que fuera casualidad.
     (aritmética un poco más lenta que con floats nativos) es irrelevante
     para el volumen de este sistema.
 - **Autenticación:** JWT.
-- **Redis:** usado para (1) lock
-  rápido de idempotencia en la creación de pagos (ver sección
-  "Idempotencia y concurrencia" — ya implementado, `internal/infrastructure/redis`),
-  y (2) cache del endpoint de resumen por comercio (Fase 6, todavía no
-  implementado), invalidada al cambiar el estado de un pago.
+- **Redis:** usado para (1) lock rápido de idempotencia en la creación de
+  pagos (ver sección "Idempotencia y concurrencia") y (2) cache del
+  endpoint de resumen por comercio (`GET /merchants/{id}/summary`),
+  invalidada explícitamente cuando cambia el estado de un pago de ese
+  comercio — no solo dejada expirar por TTL (30s), para que el resumen
+  nunca muestre datos desactualizados tras un cambio real. Ambos usos
+  siguen el mismo principio: Redis es una optimización de mejor esfuerzo,
+  nunca la fuente de verdad — si no está configurado o falla, el sistema
+  sigue siendo correcto (`NoopIdempotencyLocker`/`NoopSummaryCache`),
+  solo un poco más lento.
 
 _(Se irán agregando las decisiones puntuales de cada fase, con su
 justificación.)_

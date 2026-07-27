@@ -235,3 +235,43 @@ func TestPaymentRepository_List_Pagination(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, int64(3), total)
 }
+
+func TestPaymentRepository_GetSummaryByMerchantID(t *testing.T) {
+	db := testDB(t)
+	merchant := createTestMerchant(t, db)
+	repo := postgres.NewPaymentRepository(db)
+	ctx := context.Background()
+
+	approved := newTestPayment(t, merchant.ID, "key-"+uuid.New().String())
+	require.NoError(t, repo.Create(ctx, approved))
+	require.NoError(t, approved.ChangeStatus(domain.PaymentStatusApproved))
+	require.NoError(t, repo.UpdateStatus(ctx, approved))
+
+	rejected := newTestPayment(t, merchant.ID, "key-"+uuid.New().String())
+	require.NoError(t, repo.Create(ctx, rejected))
+	require.NoError(t, rejected.ChangeStatus(domain.PaymentStatusRejected))
+	require.NoError(t, repo.UpdateStatus(ctx, rejected))
+
+	require.NoError(t, repo.Create(ctx, newTestPayment(t, merchant.ID, "key-"+uuid.New().String())))
+
+	summary, err := repo.GetSummaryByMerchantID(ctx, merchant.ID)
+	require.NoError(t, err)
+
+	require.Equal(t, int64(3), summary.TotalPayments)
+	require.Equal(t, int64(1), summary.ApprovedPayments)
+	require.Equal(t, int64(1), summary.RejectedPayments)
+	require.Equal(t, int64(1), summary.PendingPayments)
+	require.True(t, approved.Amount.Amount.Equal(summary.ApprovedAmount))
+}
+
+func TestPaymentRepository_GetSummaryByMerchantID_NoPayments(t *testing.T) {
+	db := testDB(t)
+	merchant := createTestMerchant(t, db)
+	repo := postgres.NewPaymentRepository(db)
+
+	summary, err := repo.GetSummaryByMerchantID(context.Background(), merchant.ID)
+
+	require.NoError(t, err)
+	require.Equal(t, int64(0), summary.TotalPayments)
+	require.True(t, summary.ApprovedAmount.IsZero())
+}

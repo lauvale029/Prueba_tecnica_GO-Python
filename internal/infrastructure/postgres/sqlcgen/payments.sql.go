@@ -95,6 +95,38 @@ func (q *Queries) CreatePayment(ctx context.Context, arg CreatePaymentParams) (P
 	return i, err
 }
 
+const getMerchantSummary = `-- name: GetMerchantSummary :one
+SELECT
+    count(*) AS total_payments,
+    count(*) FILTER (WHERE status = 'APPROVED') AS approved_payments,
+    count(*) FILTER (WHERE status = 'REJECTED') AS rejected_payments,
+    count(*) FILTER (WHERE status = 'PENDING') AS pending_payments,
+    COALESCE(sum(amount) FILTER (WHERE status = 'APPROVED'), 0)::numeric AS approved_amount
+FROM payments
+WHERE merchant_id = $1
+`
+
+type GetMerchantSummaryRow struct {
+	TotalPayments    int64
+	ApprovedPayments int64
+	RejectedPayments int64
+	PendingPayments  int64
+	ApprovedAmount   decimal.Decimal
+}
+
+func (q *Queries) GetMerchantSummary(ctx context.Context, merchantID string) (GetMerchantSummaryRow, error) {
+	row := q.db.QueryRowContext(ctx, getMerchantSummary, merchantID)
+	var i GetMerchantSummaryRow
+	err := row.Scan(
+		&i.TotalPayments,
+		&i.ApprovedPayments,
+		&i.RejectedPayments,
+		&i.PendingPayments,
+		&i.ApprovedAmount,
+	)
+	return i, err
+}
+
 const getPaymentByID = `-- name: GetPaymentByID :one
 SELECT id, merchant_id, external_reference, amount, currency, payment_method, status, idempotency_key, created_at, updated_at FROM payments
 WHERE id = $1
