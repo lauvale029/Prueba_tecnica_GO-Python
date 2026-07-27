@@ -45,7 +45,7 @@ func TestCreatePayment_Success(t *testing.T) {
 		"payment_method":     "QR",
 	})
 
-	resp, err := ta.app.Test(req)
+	resp, err := ta.test(req)
 	require.NoError(t, err)
 	require.Equal(t, http.StatusCreated, resp.StatusCode)
 
@@ -72,7 +72,7 @@ func TestCreatePayment_MissingIdempotencyKey(t *testing.T) {
 		"payment_method":     "QR",
 	})
 
-	resp, err := ta.app.Test(req)
+	resp, err := ta.test(req)
 	require.NoError(t, err)
 	require.Equal(t, http.StatusUnprocessableEntity, resp.StatusCode)
 
@@ -93,7 +93,7 @@ func TestCreatePayment_InvalidAmount(t *testing.T) {
 		"payment_method":     "QR",
 	})
 
-	resp, err := ta.app.Test(req)
+	resp, err := ta.test(req)
 	require.NoError(t, err)
 	require.Equal(t, http.StatusUnprocessableEntity, resp.StatusCode)
 }
@@ -109,7 +109,7 @@ func TestCreatePayment_MerchantNotFound(t *testing.T) {
 		"payment_method":     "QR",
 	})
 
-	resp, err := ta.app.Test(req)
+	resp, err := ta.test(req)
 	require.NoError(t, err)
 	require.Equal(t, http.StatusNotFound, resp.StatusCode)
 
@@ -131,13 +131,13 @@ func TestCreatePayment_IdempotentReplay(t *testing.T) {
 		"payment_method":     "QR",
 	}
 
-	firstResp, err := ta.app.Test(newCreatePaymentRequest(merchant.ID, key, body))
+	firstResp, err := ta.test(newCreatePaymentRequest(merchant.ID, key, body))
 	require.NoError(t, err)
 	require.Equal(t, http.StatusCreated, firstResp.StatusCode)
 	var first map[string]any
 	require.NoError(t, json.NewDecoder(firstResp.Body).Decode(&first))
 
-	secondResp, err := ta.app.Test(newCreatePaymentRequest(merchant.ID, key, body))
+	secondResp, err := ta.test(newCreatePaymentRequest(merchant.ID, key, body))
 	require.NoError(t, err)
 	require.Equal(t, http.StatusCreated, secondResp.StatusCode)
 	var second map[string]any
@@ -158,13 +158,13 @@ func TestCreatePayment_DuplicateExternalReference(t *testing.T) {
 		"payment_method":     "QR",
 	}
 
-	firstResp, err := ta.app.Test(newCreatePaymentRequest(merchant.ID, "key-"+uuid.New().String(), body))
+	firstResp, err := ta.test(newCreatePaymentRequest(merchant.ID, "key-"+uuid.New().String(), body))
 	require.NoError(t, err)
 	require.Equal(t, http.StatusCreated, firstResp.StatusCode)
 
 	// Misma referencia externa, pero una Idempotency-Key DISTINTA: no es
 	// un reintento, es un pago nuevo con una referencia ya usada.
-	secondResp, err := ta.app.Test(newCreatePaymentRequest(merchant.ID, "key-"+uuid.New().String(), body))
+	secondResp, err := ta.test(newCreatePaymentRequest(merchant.ID, "key-"+uuid.New().String(), body))
 	require.NoError(t, err)
 	require.Equal(t, http.StatusConflict, secondResp.StatusCode)
 
@@ -180,7 +180,7 @@ func TestCreatePayment_InvalidBody(t *testing.T) {
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Idempotency-Key", "key-1")
 
-	resp, err := ta.app.Test(req)
+	resp, err := ta.test(req)
 	require.NoError(t, err)
 	require.Equal(t, http.StatusBadRequest, resp.StatusCode)
 }
@@ -193,7 +193,7 @@ func createTestPayment(t *testing.T, ta testApp, merchantID, externalReference s
 		"currency":           "COP",
 		"payment_method":     "QR",
 	})
-	resp, err := ta.app.Test(req)
+	resp, err := ta.test(req)
 	require.NoError(t, err)
 	require.Equal(t, http.StatusCreated, resp.StatusCode)
 
@@ -208,7 +208,7 @@ func TestGetPayment_Success(t *testing.T) {
 	created := createTestPayment(t, ta, merchant.ID, "ORDER-GET-1")
 
 	req := httptest.NewRequest(http.MethodGet, "/api/v1/payments/"+created["id"].(string), nil)
-	resp, err := ta.app.Test(req)
+	resp, err := ta.test(req)
 	require.NoError(t, err)
 	require.Equal(t, http.StatusOK, resp.StatusCode)
 
@@ -221,7 +221,7 @@ func TestGetPayment_NotFound(t *testing.T) {
 	ta := setupApp()
 
 	req := httptest.NewRequest(http.MethodGet, "/api/v1/payments/id-que-no-existe", nil)
-	resp, err := ta.app.Test(req)
+	resp, err := ta.test(req)
 	require.NoError(t, err)
 	require.Equal(t, http.StatusNotFound, resp.StatusCode)
 
@@ -238,7 +238,7 @@ func TestListPayments_FilterByMerchant(t *testing.T) {
 	createTestPayment(t, ta, merchantB.ID, "ORDER-B-1")
 
 	req := httptest.NewRequest(http.MethodGet, "/api/v1/payments?merchant_id="+merchantA.ID, nil)
-	resp, err := ta.app.Test(req)
+	resp, err := ta.test(req)
 	require.NoError(t, err)
 	require.Equal(t, http.StatusOK, resp.StatusCode)
 
@@ -260,7 +260,7 @@ func TestListPayments_InvalidMerchantIDFilter(t *testing.T) {
 	ta := setupApp()
 
 	req := httptest.NewRequest(http.MethodGet, "/api/v1/payments?merchant_id=no-es-un-uuid", nil)
-	resp, err := ta.app.Test(req)
+	resp, err := ta.test(req)
 	require.NoError(t, err)
 	require.Equal(t, http.StatusBadRequest, resp.StatusCode)
 }
@@ -269,7 +269,7 @@ func TestListPayments_InvalidStatusFilter(t *testing.T) {
 	ta := setupApp()
 
 	req := httptest.NewRequest(http.MethodGet, "/api/v1/payments?status=NOT_A_STATUS", nil)
-	resp, err := ta.app.Test(req)
+	resp, err := ta.test(req)
 	require.NoError(t, err)
 	require.Equal(t, http.StatusBadRequest, resp.StatusCode)
 }
@@ -283,7 +283,7 @@ func TestUpdatePaymentStatus_Success(t *testing.T) {
 	req := httptest.NewRequest(http.MethodPatch, "/api/v1/payments/"+created["id"].(string)+"/status", bytes.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
 
-	resp, err := ta.app.Test(req)
+	resp, err := ta.test(req)
 	require.NoError(t, err)
 	require.Equal(t, http.StatusOK, resp.StatusCode)
 
@@ -300,14 +300,14 @@ func TestUpdatePaymentStatus_InvalidTransition(t *testing.T) {
 	approve, _ := json.Marshal(map[string]string{"status": "APPROVED"})
 	req := httptest.NewRequest(http.MethodPatch, "/api/v1/payments/"+created["id"].(string)+"/status", bytes.NewReader(approve))
 	req.Header.Set("Content-Type", "application/json")
-	resp, err := ta.app.Test(req)
+	resp, err := ta.test(req)
 	require.NoError(t, err)
 	require.Equal(t, http.StatusOK, resp.StatusCode)
 
 	reject, _ := json.Marshal(map[string]string{"status": "REJECTED"})
 	req2 := httptest.NewRequest(http.MethodPatch, "/api/v1/payments/"+created["id"].(string)+"/status", bytes.NewReader(reject))
 	req2.Header.Set("Content-Type", "application/json")
-	resp2, err := ta.app.Test(req2)
+	resp2, err := ta.test(req2)
 	require.NoError(t, err)
 	require.Equal(t, http.StatusConflict, resp2.StatusCode)
 
@@ -323,7 +323,7 @@ func TestUpdatePaymentStatus_PaymentNotFound(t *testing.T) {
 	req := httptest.NewRequest(http.MethodPatch, "/api/v1/payments/id-que-no-existe/status", bytes.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
 
-	resp, err := ta.app.Test(req)
+	resp, err := ta.test(req)
 	require.NoError(t, err)
 	require.Equal(t, http.StatusNotFound, resp.StatusCode)
 }
@@ -336,12 +336,12 @@ func TestGetPaymentHistory_Success(t *testing.T) {
 	body, _ := json.Marshal(map[string]string{"status": "APPROVED", "reason": "confirmado"})
 	req := httptest.NewRequest(http.MethodPatch, "/api/v1/payments/"+created["id"].(string)+"/status", bytes.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
-	resp, err := ta.app.Test(req)
+	resp, err := ta.test(req)
 	require.NoError(t, err)
 	require.Equal(t, http.StatusOK, resp.StatusCode)
 
 	histReq := httptest.NewRequest(http.MethodGet, "/api/v1/payments/"+created["id"].(string)+"/history", nil)
-	histResp, err := ta.app.Test(histReq)
+	histResp, err := ta.test(histReq)
 	require.NoError(t, err)
 	require.Equal(t, http.StatusOK, histResp.StatusCode)
 
@@ -356,7 +356,7 @@ func TestGetPaymentHistory_PaymentNotFound(t *testing.T) {
 	ta := setupApp()
 
 	req := httptest.NewRequest(http.MethodGet, "/api/v1/payments/id-que-no-existe/history", nil)
-	resp, err := ta.app.Test(req)
+	resp, err := ta.test(req)
 	require.NoError(t, err)
 	require.Equal(t, http.StatusNotFound, resp.StatusCode)
 }

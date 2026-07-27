@@ -2,16 +2,23 @@ package http_test
 
 import (
 	"context"
+	"net/http"
 	"sort"
 	"sync"
+	"time"
 
 	"github.com/gofiber/fiber/v2"
 	"github.com/shopspring/decimal"
 
 	"github.com/lauvale029/Prueba_tecnica_GO-Python/internal/application"
 	"github.com/lauvale029/Prueba_tecnica_GO-Python/internal/domain"
+	authinfra "github.com/lauvale029/Prueba_tecnica_GO-Python/internal/infrastructure/auth"
 	transporthttp "github.com/lauvale029/Prueba_tecnica_GO-Python/internal/transport/http"
 )
+
+// testJWTSecret firma los tokens usados en este paquete de tests; no
+// tiene relación con el JWT_SECRET real de .env.
+const testJWTSecret = "test-secret-no-usar-en-produccion"
 
 // fakeMerchantRepository y fakePaymentRepository reutilizan
 // application.ErrNotFound/ErrConflict a propósito: los handlers
@@ -240,13 +247,22 @@ func (f *fakeHistoryRepository) ListByPaymentID(_ context.Context, paymentID str
 }
 
 // testApp agrupa lo que necesitan los tests de este paquete: la app de
-// Fiber ya armada, y los repositorios falsos para poder "sembrar" datos
-// antes de hacer una petición HTTP.
+// Fiber ya armada, los repositorios falsos para poder "sembrar" datos
+// antes de hacer una petición HTTP, y un token válido para autenticar
+// las peticiones a rutas protegidas.
 type testApp struct {
 	app       *fiber.App
 	merchants *fakeMerchantRepository
 	payments  *fakePaymentRepository
 	history   *fakeHistoryRepository
+	token     string
+}
+
+// test envía req a través de la app añadiendo antes el header
+// Authorization con un token válido, para no repetirlo en cada test.
+func (ta testApp) test(req *http.Request) (*http.Response, error) {
+	req.Header.Set("Authorization", "Bearer "+ta.token)
+	return ta.app.Test(req)
 }
 
 func setupApp() testApp {
@@ -260,10 +276,18 @@ func setupApp() testApp {
 	merchantService := application.NewMerchantService(merchantRepo)
 	merchantHandler := transporthttp.NewMerchantHandler(merchantService, paymentService)
 
+	authHandler := transporthttp.NewAuthHandler("mova-service", "Mova-Service#123", testJWTSecret, time.Hour)
+
+	token, _, err := authinfra.IssueToken(testJWTSecret, "mova-service", time.Hour)
+	if err != nil {
+		panic(err)
+	}
+
 	return testApp{
-		app:       transporthttp.NewRouter(merchantHandler, paymentHandler),
+		app:       transporthttp.NewRouter(merchantHandler, paymentHandler, authHandler, testJWTSecret),
 		merchants: merchantRepo,
 		payments:  paymentRepo,
 		history:   historyRepo,
+		token:     token,
 	}
 }

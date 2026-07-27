@@ -42,7 +42,9 @@ func main() {
 	merchantService := application.NewMerchantService(merchantRepo)
 	merchantHandler := transporthttp.NewMerchantHandler(merchantService, paymentService)
 
-	app := transporthttp.NewRouter(merchantHandler, paymentHandler)
+	authHandler := transporthttp.NewAuthHandler(cfg.AuthUsername, cfg.AuthPassword, cfg.JWTSecret, cfg.JWTExpiration)
+
+	app := transporthttp.NewRouter(merchantHandler, paymentHandler, authHandler, cfg.JWTSecret)
 
 	log.Printf("MOVA payments API listening on port %s", cfg.Port)
 	if err := app.Listen(":" + cfg.Port); err != nil {

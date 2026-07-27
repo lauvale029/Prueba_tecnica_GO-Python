@@ -24,7 +24,7 @@ func TestCreateMerchant_Success(t *testing.T) {
 	req := httptest.NewRequest(http.MethodPost, "/api/v1/merchants", bytes.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
 
-	resp, err := ta.app.Test(req)
+	resp, err := ta.test(req)
 	require.NoError(t, err)
 	require.Equal(t, http.StatusCreated, resp.StatusCode)
 
@@ -40,7 +40,7 @@ func TestCreateMerchant_InvalidBody(t *testing.T) {
 	req := httptest.NewRequest(http.MethodPost, "/api/v1/merchants", bytes.NewReader([]byte("{esto no es json")))
 	req.Header.Set("Content-Type", "application/json")
 
-	resp, err := ta.app.Test(req)
+	resp, err := ta.test(req)
 	require.NoError(t, err)
 	require.Equal(t, http.StatusBadRequest, resp.StatusCode)
 }
@@ -56,7 +56,7 @@ func TestCreateMerchant_InvalidEmail(t *testing.T) {
 	req := httptest.NewRequest(http.MethodPost, "/api/v1/merchants", bytes.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
 
-	resp, err := ta.app.Test(req)
+	resp, err := ta.test(req)
 	require.NoError(t, err)
 	require.Equal(t, http.StatusUnprocessableEntity, resp.StatusCode)
 
@@ -79,7 +79,7 @@ func TestCreateMerchant_DuplicateDocumentNumber(t *testing.T) {
 	req := httptest.NewRequest(http.MethodPost, "/api/v1/merchants", bytes.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
 
-	resp, err := ta.app.Test(req)
+	resp, err := ta.test(req)
 	require.NoError(t, err)
 	require.Equal(t, http.StatusConflict, resp.StatusCode)
 
@@ -96,7 +96,7 @@ func TestGetMerchant_Success(t *testing.T) {
 
 	req := httptest.NewRequest(http.MethodGet, "/api/v1/merchants/"+merchant.ID, nil)
 
-	resp, err := ta.app.Test(req)
+	resp, err := ta.test(req)
 	require.NoError(t, err)
 	require.Equal(t, http.StatusOK, resp.StatusCode)
 
@@ -110,7 +110,7 @@ func TestGetMerchant_NotFound(t *testing.T) {
 
 	req := httptest.NewRequest(http.MethodGet, "/api/v1/merchants/id-que-no-existe", nil)
 
-	resp, err := ta.app.Test(req)
+	resp, err := ta.test(req)
 	require.NoError(t, err)
 	require.Equal(t, http.StatusNotFound, resp.StatusCode)
 
@@ -124,7 +124,7 @@ func TestGetMerchantSummary_Success(t *testing.T) {
 	createTestPayment(t, ta, merchant.ID, "ORDER-SUMMARY-1")
 
 	req := httptest.NewRequest(http.MethodGet, "/api/v1/merchants/"+merchant.ID+"/summary", nil)
-	resp, err := ta.app.Test(req)
+	resp, err := ta.test(req)
 	require.NoError(t, err)
 	require.Equal(t, http.StatusOK, resp.StatusCode)
 
@@ -140,7 +140,7 @@ func TestGetMerchantSummary_NotFound(t *testing.T) {
 	ta := setupApp()
 
 	req := httptest.NewRequest(http.MethodGet, "/api/v1/merchants/id-que-no-existe/summary", nil)
-	resp, err := ta.app.Test(req)
+	resp, err := ta.test(req)
 	require.NoError(t, err)
 	require.Equal(t, http.StatusNotFound, resp.StatusCode)
 
