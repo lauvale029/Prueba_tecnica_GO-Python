@@ -1,6 +1,7 @@
 package http
 
 import (
+	"encoding/json"
 	"errors"
 	"time"
 
@@ -11,11 +12,16 @@ import (
 )
 
 type MerchantHandler struct {
-	service *application.MerchantService
+	service  *application.MerchantService
+	payments *application.PaymentService
 }
 
-func NewMerchantHandler(service *application.MerchantService) *MerchantHandler {
-	return &MerchantHandler{service: service}
+// NewMerchantHandler recibe también *application.PaymentService porque
+// Summary (GET /merchants/{id}/summary) es, por debajo, un cálculo sobre
+// pagos — el caso de uso vive en PaymentService (ver README, Decisiones
+// técnicas), aunque la ruta cuelga de /merchants.
+func NewMerchantHandler(service *application.MerchantService, payments *application.PaymentService) *MerchantHandler {
+	return &MerchantHandler{service: service, payments: payments}
 }
 
 type createMerchantRequest struct {
@@ -71,6 +77,35 @@ func (h *MerchantHandler) Get(c *fiber.Ctx) error {
 	}
 
 	return c.JSON(toMerchantResponse(merchant))
+}
+
+type merchantSummaryResponse struct {
+	MerchantID       string      `json:"merchant_id"`
+	TotalPayments    int64       `json:"total_payments"`
+	ApprovedPayments int64       `json:"approved_payments"`
+	RejectedPayments int64       `json:"rejected_payments"`
+	PendingPayments  int64       `json:"pending_payments"`
+	ApprovedAmount   json.Number `json:"approved_amount"`
+}
+
+func toMerchantSummaryResponse(s *application.MerchantSummary) merchantSummaryResponse {
+	return merchantSummaryResponse{
+		MerchantID:       s.MerchantID,
+		TotalPayments:    s.TotalPayments,
+		ApprovedPayments: s.ApprovedPayments,
+		RejectedPayments: s.RejectedPayments,
+		PendingPayments:  s.PendingPayments,
+		ApprovedAmount:   json.Number(s.ApprovedAmount.String()),
+	}
+}
+
+// Summary maneja GET /api/v1/merchants/{merchant_id}/summary.
+func (h *MerchantHandler) Summary(c *fiber.Ctx) error {
+	summary, err := h.payments.Summary(c.Context(), c.Params("merchant_id"))
+	if err != nil {
+		return respondMerchantError(c, err)
+	}
+	return c.JSON(toMerchantSummaryResponse(summary))
 }
 
 func respondMerchantError(c *fiber.Ctx, err error) error {
