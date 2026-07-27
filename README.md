@@ -213,6 +213,11 @@ completo.
 - PostgreSQL 16 (via Docker Compose, no requiere instalación local)
 - Redis 7 (via Docker Compose, no requiere instalación local)
 - Python 3.11+ (solo para el worker de conciliación)
+- **En Windows:** los scripts de `scripts/` (`migrate.sh`,
+  `sqlc-generate.sh`) son scripts de bash — hay que ejecutarlos desde
+  **Git Bash** o WSL, no desde `cmd.exe` ni PowerShell directamente
+  (ninguno de los dos interpreta bash). El resto de comandos de esta
+  guía (`docker`, `curl`, `go`) funcionan igual en cualquier terminal.
 
 ## Instalación
 
@@ -286,7 +291,7 @@ esquema inicial: `merchants`, `payments`, `payment_status_history`; su
 imagen Docker oficial, sin necesidad de instalar nada localmente.
 
 Con Postgres ya levantado (`docker compose up -d postgres`) y el `.env`
-completo:
+completo (en Windows, corre esto desde **Git Bash**, ver "Requisitos"):
 
 ```bash
 scripts/migrate.sh up          # aplica todas las migraciones pendientes
