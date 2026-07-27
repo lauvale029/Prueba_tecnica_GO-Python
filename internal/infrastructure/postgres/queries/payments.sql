@@ -41,3 +41,13 @@ WHERE (sqlc.narg('merchant_id')::uuid IS NULL OR merchant_id = sqlc.narg('mercha
   AND (sqlc.narg('payment_method')::text IS NULL OR payment_method = sqlc.narg('payment_method'))
   AND (sqlc.narg('date_from')::timestamptz IS NULL OR created_at >= sqlc.narg('date_from'))
   AND (sqlc.narg('date_to')::timestamptz IS NULL OR created_at <= sqlc.narg('date_to'));
+
+-- name: GetMerchantSummary :one
+SELECT
+    count(*) AS total_payments,
+    count(*) FILTER (WHERE status = 'APPROVED') AS approved_payments,
+    count(*) FILTER (WHERE status = 'REJECTED') AS rejected_payments,
+    count(*) FILTER (WHERE status = 'PENDING') AS pending_payments,
+    COALESCE(sum(amount) FILTER (WHERE status = 'APPROVED'), 0)::numeric AS approved_amount
+FROM payments
+WHERE merchant_id = $1;
