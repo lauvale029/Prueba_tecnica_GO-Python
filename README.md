@@ -42,6 +42,170 @@ nada externo (ni de Fiber ni de Postgres); `application` depende solo de
 interfaces de dominio; `infrastructure` y `transport` son los únicos que
 conocen detalles concretos (Fiber, SQL, Redis).
 
+### Diagrama de arquitectura
+
+```mermaid
+flowchart TB
+    subgraph Consumers["Consumidores"]
+        direction LR
+        CURL["Cliente HTTP<br/>(Postman / curl)"]
+        PY["Worker de conciliación<br/>(Python)"]
+    end
+
+    MW["middleware.RequireAuth<br/>(valida JWT)"]
+
+    subgraph Transport["Transport (HTTP)"]
+        direction LR
+        AuthH["AuthHandler"]
+        MerchH["MerchantHandler"]
+        PayH["PaymentHandler"]
+    end
+
+    subgraph Application["Application"]
+        direction LR
+        MerchS["MerchantService"]
+        PayS["PaymentService"]
+    end
+
+    Domain["Domain<br/>Merchant · Payment · PaymentStatusHistory · Money"]
+
+    subgraph Infra["Infrastructure"]
+        direction LR
+        PgRepo["postgres.*Repository"]
+        RedisLock["redis.IdempotencyLocker"]
+        RedisCache["redis.SummaryCache"]
+        JWTAuth["infrastructure/auth"]
+    end
+
+    PG[("PostgreSQL")]
+    RD[("Redis")]
+
+    CURL --> MW
+    PY --> MW
+    MW --> AuthH
+    MW --> MerchH
+    MW --> PayH
+    AuthH --> JWTAuth
+    MerchH --> MerchS
+    MerchH --> PayS
+    PayH --> PayS
+    MerchS --> Domain
+    PayS --> Domain
+    MerchS --> PgRepo
+    PayS --> PgRepo
+    PayS --> RedisLock
+    PayS --> RedisCache
+    PgRepo --> PG
+    RedisLock --> RD
+    RedisCache --> RD
+```
+
+- **Consumidores:** quien llama a la API — un cliente HTTP manual
+  (Postman/curl) o el worker de conciliación en Python.
+- **Transport (HTTP):** handlers Fiber + DTOs de request/response;
+  mapea errores de las capas de abajo a códigos HTTP.
+- **Application:** casos de uso (`MerchantService`, `PaymentService`) y
+  los puertos (interfaces) que necesitan de la infraestructura.
+- **Domain:** `Merchant`, `Payment`, `PaymentStatusHistory`, `Money` —
+  sin ninguna dependencia externa (ni Fiber, ni SQL, ni Redis).
+- **Infrastructure:** adaptadores concretos — repositorios Postgres
+  (`sqlc` + `pgx`), lock/cache de Redis, emisión/validación de JWT.
+
+`MerchantHandler` depende también de `PaymentService` porque el resumen
+por comercio (`GET /merchants/{id}/summary`) es, de fondo, un cálculo
+sobre pagos — el caso de uso vive en `PaymentService` aunque la ruta
+cuelga de `/merchants` (ver Decisiones técnicas).
+
+### Diagrama entidad-relación
+
+```mermaid
+erDiagram
+    MERCHANTS ||--o{ PAYMENTS : "tiene"
+    PAYMENTS ||--o{ PAYMENT_STATUS_HISTORY : "registra"
+
+    MERCHANTS {
+        uuid id PK
+        text name
+        text document_number UK
+        text email
+        text status
+        timestamptz created_at
+        timestamptz updated_at
+    }
+
+    PAYMENTS {
+        uuid id PK
+        uuid merchant_id FK
+        text external_reference
+        numeric amount
+        text currency
+        text payment_method
+        text status
+        text idempotency_key UK
+        timestamptz created_at
+        timestamptz updated_at
+    }
+
+    PAYMENT_STATUS_HISTORY {
+        uuid id PK
+        uuid payment_id FK
+        text previous_status
+        text new_status
+        text reason
+        text changed_by
+        timestamptz created_at
+    }
+```
+
+`payments` tiene además una restricción única **compuesta**
+`(merchant_id, external_reference)` — no representable como una sola
+columna `UK` en el diagrama — que impide que el mismo comercio registre
+dos veces la misma referencia externa (ver "Idempotencia y
+concurrencia"). Ver `migrations/0001_init_schema.up.sql` para el DDL
+completo.
+
+### Patrones de diseño utilizados
+
+- **Arquitectura hexagonal (Ports & Adapters):** el patrón estructural
+  central de todo el proyecto — ver más abajo, en Decisiones técnicas,
+  la justificación completa.
+- **Repository:** `MerchantRepository`, `PaymentRepository`,
+  `PaymentStatusHistoryRepository` (`internal/application/ports.go`) son
+  interfaces que `application` define y `internal/infrastructure/postgres`
+  implementa — el caso de uso nunca sabe que hay SQL detrás.
+- **Adapter:** `internal/infrastructure/postgres` y `.../redis` adaptan
+  librerías externas (`pgx`, `go-redis`) a los puertos que `application`
+  espera, sin filtrar esos detalles hacia arriba.
+- **Null Object:** `NoopIdempotencyLocker`/`NoopSummaryCache`
+  (`internal/application/ports.go`) implementan los mismos puertos que
+  sus versiones de Redis, pero "no hacen nada" (nunca consiguen el lock,
+  siempre fallan el cache) — `PaymentService` no necesita ningún `if
+  redis != nil` para funcionar sin Redis.
+- **Cache-Aside:** `SummaryCache.Get` → miss → `PaymentService` calcula
+  contra Postgres → `Set` — con invalidación explícita al cambiar el
+  estado de un pago (ver "Idempotencia y concurrencia").
+- **DTO (Data Transfer Object):** los structs de request/response en
+  `internal/transport/http` (`paymentResponse`, `createPaymentRequest`,
+  etc.) son deliberadamente distintos de las entidades de `domain` — el
+  formato JSON de la API puede cambiar sin tocar una sola regla de
+  negocio.
+- **Inyección de dependencias por constructor:** cada `NewXxxService`/
+  `NewXxxHandler`/`NewXxxRepository` recibe sus dependencias como
+  parámetros de interfaz (ver el ensamblado completo en
+  `cmd/api/main.go`); nada se instancia a sí mismo por dentro, lo que
+  hace posible sustituir cualquier pieza por un doble de prueba.
+- **Middleware (Chain of Responsibility):** `middleware.RequireAuth` se
+  antepone a cada handler protegido — o deja pasar la petición
+  (`c.Next()`) o la corta con `401`, sin que el handler final sepa nada
+  de JWT.
+- **Value Object:** `domain.Money` (monto + moneda) es inmutable, se
+  valida a sí mismo al construirse, y no tiene una identidad propia más
+  allá de su valor — dos `Money` con el mismo monto y moneda son
+  intercambiables.
+- **Máquina de estados explícita:** `domain.allowedTransitions` (un
+  mapa de transiciones permitidas) + `CanTransition`, en vez de una
+  cadena de `if/else` dispersa por el código, para las reglas de
+  `PaymentStatus`.
 
 ## Requisitos
 
