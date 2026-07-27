@@ -12,6 +12,7 @@ import (
 
 	"github.com/lauvale029/Prueba_tecnica_GO-Python/internal/application"
 	"github.com/lauvale029/Prueba_tecnica_GO-Python/internal/domain"
+	"github.com/lauvale029/Prueba_tecnica_GO-Python/internal/middleware"
 )
 
 type PaymentHandler struct {
@@ -90,11 +91,11 @@ func toPaymentStatusHistoryResponse(entry *domain.PaymentStatusHistory) paymentS
 	}
 }
 
-// changedBy identifica quién hizo el cambio de estado. Placeholder hasta
-// la Fase 7 (autenticación JWT): siempre devuelve un valor fijo. Cuando
-// exista JWT, se reemplaza por el subject del token autenticado.
+// changedBy identifica quién hizo el cambio de estado: el subject del
+// JWT autenticado, dejado en c.Locals por middleware.RequireAuth.
 func changedBy(c *fiber.Ctx) string {
-	return "system"
+	subject, _ := c.Locals(middleware.SubjectLocalsKey).(string)
+	return subject
 }
 
 // Create maneja POST /api/v1/payments. Requiere el header Idempotency-Key.
