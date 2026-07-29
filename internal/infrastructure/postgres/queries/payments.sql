@@ -24,6 +24,18 @@ SET status = $2, updated_at = $3
 WHERE id = $1
 RETURNING *;
 
+-- name: MarkPaymentProcessing :one
+-- Guarda a qué proveedor se envió (provider_name), la referencia de esa
+-- operación (provider_reference), y el paso a PROCESSING, en una sola
+-- escritura ANTES de llamar al proveedor externo: si el proceso se cae
+-- justo después de esta escritura y antes de recibir la respuesta del
+-- proveedor, ya queda todo lo necesario guardado para poder conciliar
+-- luego (incluyendo con cuál proveedor había que conciliar).
+UPDATE payments
+SET status = 'PROCESSING', provider_reference = $2, provider_name = $3, updated_at = $4
+WHERE id = $1
+RETURNING *;
+
 -- name: ListPayments :many
 SELECT * FROM payments
 WHERE (sqlc.narg('merchant_id')::uuid IS NULL OR merchant_id = sqlc.narg('merchant_id'))

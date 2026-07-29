@@ -34,10 +34,11 @@ type PaymentService struct {
 	history   PaymentStatusHistoryRepository
 	locker    IdempotencyLocker
 	summaries SummaryCache
+	uow       UnitOfWork
 }
 
-func NewPaymentService(payments PaymentRepository, merchants MerchantRepository, history PaymentStatusHistoryRepository, locker IdempotencyLocker, summaries SummaryCache) *PaymentService {
-	return &PaymentService{payments: payments, merchants: merchants, history: history, locker: locker, summaries: summaries}
+func NewPaymentService(payments PaymentRepository, merchants MerchantRepository, history PaymentStatusHistoryRepository, locker IdempotencyLocker, summaries SummaryCache, uow UnitOfWork) *PaymentService {
+	return &PaymentService{payments: payments, merchants: merchants, history: history, locker: locker, summaries: summaries, uow: uow}
 }
 
 // Create crea un pago nuevo, o devuelve el pago ya existente si
@@ -160,12 +161,18 @@ func (s *PaymentService) UpdateStatus(ctx context.Context, paymentID string, new
 		return nil, err
 	}
 
-	if err := s.payments.UpdateStatus(ctx, payment); err != nil {
-		return nil, err
-	}
-
+	// El cambio de estado y su entrada de historial deben persistirse
+	// juntos o no persistirse en absoluto: si el proceso se cayera entre
+	// una escritura y la otra, quedaría un pago con un estado que nadie
+	// puede explicar (sin una entrada de historial que lo justifique).
 	history := domain.NewPaymentStatusHistory(payment.ID, previousStatus, payment.Status, reason, changedBy)
-	if err := s.history.Create(ctx, history); err != nil {
+	err = s.uow.Execute(ctx, func(txCtx context.Context) error {
+		if err := s.payments.UpdateStatus(txCtx, payment); err != nil {
+			return err
+		}
+		return s.history.Create(txCtx, history)
+	})
+	if err != nil {
 		return nil, err
 	}
 

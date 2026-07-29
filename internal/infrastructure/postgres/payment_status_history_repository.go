@@ -13,17 +13,21 @@ import (
 // application.PaymentStatusHistoryRepository sobre las queries generadas
 // por sqlc.
 type PaymentStatusHistoryRepository struct {
-	queries *sqlcgen.Queries
+	db *sql.DB
 }
 
 func NewPaymentStatusHistoryRepository(db *sql.DB) *PaymentStatusHistoryRepository {
-	return &PaymentStatusHistoryRepository{queries: sqlcgen.New(db)}
+	return &PaymentStatusHistoryRepository{db: db}
 }
 
 var _ application.PaymentStatusHistoryRepository = (*PaymentStatusHistoryRepository)(nil)
 
+func (r *PaymentStatusHistoryRepository) queries(ctx context.Context) *sqlcgen.Queries {
+	return sqlcgen.New(dbtxFromContext(ctx, r.db))
+}
+
 func (r *PaymentStatusHistoryRepository) Create(ctx context.Context, history *domain.PaymentStatusHistory) error {
-	_, err := r.queries.CreatePaymentStatusHistory(ctx, sqlcgen.CreatePaymentStatusHistoryParams{
+	_, err := r.queries(ctx).CreatePaymentStatusHistory(ctx, sqlcgen.CreatePaymentStatusHistoryParams{
 		ID:             history.ID,
 		PaymentID:      history.PaymentID,
 		PreviousStatus: toNullString(string(history.PreviousStatus)),
@@ -36,7 +40,7 @@ func (r *PaymentStatusHistoryRepository) Create(ctx context.Context, history *do
 }
 
 func (r *PaymentStatusHistoryRepository) ListByPaymentID(ctx context.Context, paymentID string) ([]*domain.PaymentStatusHistory, error) {
-	rows, err := r.queries.ListPaymentStatusHistoryByPaymentID(ctx, paymentID)
+	rows, err := r.queries(ctx).ListPaymentStatusHistoryByPaymentID(ctx, paymentID)
 	if err != nil {
 		return nil, mapError(err)
 	}

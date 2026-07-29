@@ -138,6 +138,21 @@ func (f *fakePaymentRepository) UpdateStatus(_ context.Context, payment *domain.
 	return nil
 }
 
+func (f *fakePaymentRepository) MarkProcessing(_ context.Context, paymentID, providerReference, providerName string, updatedAt time.Time) (*domain.Payment, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	payment, ok := f.byID[paymentID]
+	if !ok {
+		return nil, application.ErrNotFound
+	}
+	payment.Status = domain.PaymentStatusProcessing
+	payment.ProviderReference = &providerReference
+	payment.ProviderName = &providerName
+	payment.UpdatedAt = updatedAt
+	return payment, nil
+}
+
 // List/Count sí filtran de verdad (a diferencia del fake equivalente en
 // internal/application): acá queremos probar que los query params del
 // endpoint HTTP realmente se traducen en el filtrado correcto de punta a
@@ -265,12 +280,20 @@ func (ta testApp) test(req *http.Request) (*http.Response, error) {
 	return ta.app.Test(req)
 }
 
+// fakeUnitOfWork simplemente ejecuta fn con el mismo ctx — ver la nota
+// equivalente en internal/application/payment_service_test.go.
+type fakeUnitOfWork struct{}
+
+func (fakeUnitOfWork) Execute(ctx context.Context, fn func(ctx context.Context) error) error {
+	return fn(ctx)
+}
+
 func setupApp() testApp {
 	merchantRepo := newFakeMerchantRepository()
 	paymentRepo := newFakePaymentRepository()
 	historyRepo := newFakeHistoryRepository()
 
-	paymentService := application.NewPaymentService(paymentRepo, merchantRepo, historyRepo, application.NoopIdempotencyLocker{}, application.NoopSummaryCache{})
+	paymentService := application.NewPaymentService(paymentRepo, merchantRepo, historyRepo, application.NoopIdempotencyLocker{}, application.NoopSummaryCache{}, fakeUnitOfWork{})
 	paymentHandler := transporthttp.NewPaymentHandler(paymentService)
 
 	merchantService := application.NewMerchantService(merchantRepo)

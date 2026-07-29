@@ -2,7 +2,15 @@ version: "2"
 sql:
   - engine: "postgresql"
     queries: "internal/infrastructure/postgres/queries"
-    schema: "migrations/0001_init_schema.up.sql"
+    # Cada migración .up.sql se lista explícitamente, en orden — sqlc no
+    # sabe de migraciones "nuevas" solo, hay que agregarlas acá a mano
+    # cada vez (evitamos apuntar a la carpeta completa para no que sqlc
+    # intente leer también los .down.sql, que deshacen lo que el .up.sql
+    # anterior acababa de crear).
+    schema:
+      - "migrations/0001_init_schema.up.sql"
+      - "migrations/0002_add_payment_provider_reference.up.sql"
+      - "migrations/0003_add_payment_provider_name.up.sql"
     gen:
       go:
         package: "sqlcgen"

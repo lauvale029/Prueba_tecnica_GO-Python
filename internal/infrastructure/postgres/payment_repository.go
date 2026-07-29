@@ -13,19 +13,26 @@ import (
 )
 
 // PaymentRepository implementa application.PaymentRepository sobre las
-// queries generadas por sqlc.
+// queries generadas por sqlc. Guarda *sql.DB en vez de un *sqlcgen.Queries
+// ya armado porque cada método arma sus queries al momento (ver
+// PaymentRepository.queries), para poder usar la transacción activa del
+// contexto cuando la hay (ver tx.go/unit_of_work.go).
 type PaymentRepository struct {
-	queries *sqlcgen.Queries
+	db *sql.DB
 }
 
 func NewPaymentRepository(db *sql.DB) *PaymentRepository {
-	return &PaymentRepository{queries: sqlcgen.New(db)}
+	return &PaymentRepository{db: db}
 }
 
 var _ application.PaymentRepository = (*PaymentRepository)(nil)
 
+func (r *PaymentRepository) queries(ctx context.Context) *sqlcgen.Queries {
+	return sqlcgen.New(dbtxFromContext(ctx, r.db))
+}
+
 func (r *PaymentRepository) Create(ctx context.Context, payment *domain.Payment) error {
-	_, err := r.queries.CreatePayment(ctx, sqlcgen.CreatePaymentParams{
+	_, err := r.queries(ctx).CreatePayment(ctx, sqlcgen.CreatePaymentParams{
 		ID:                payment.ID,
 		MerchantID:        payment.MerchantID,
 		ExternalReference: payment.ExternalReference,
@@ -41,7 +48,7 @@ func (r *PaymentRepository) Create(ctx context.Context, payment *domain.Payment)
 }
 
 func (r *PaymentRepository) GetByID(ctx context.Context, id string) (*domain.Payment, error) {
-	row, err := r.queries.GetPaymentByID(ctx, id)
+	row, err := r.queries(ctx).GetPaymentByID(ctx, id)
 	if err != nil {
 		return nil, mapError(err)
 	}
@@ -49,7 +56,7 @@ func (r *PaymentRepository) GetByID(ctx context.Context, id string) (*domain.Pay
 }
 
 func (r *PaymentRepository) GetByIdempotencyKey(ctx context.Context, idempotencyKey string) (*domain.Payment, error) {
-	row, err := r.queries.GetPaymentByIdempotencyKey(ctx, idempotencyKey)
+	row, err := r.queries(ctx).GetPaymentByIdempotencyKey(ctx, idempotencyKey)
 	if err != nil {
 		return nil, mapError(err)
 	}
@@ -57,7 +64,7 @@ func (r *PaymentRepository) GetByIdempotencyKey(ctx context.Context, idempotency
 }
 
 func (r *PaymentRepository) GetByMerchantAndExternalReference(ctx context.Context, merchantID, externalReference string) (*domain.Payment, error) {
-	row, err := r.queries.GetPaymentByMerchantAndExternalReference(ctx, sqlcgen.GetPaymentByMerchantAndExternalReferenceParams{
+	row, err := r.queries(ctx).GetPaymentByMerchantAndExternalReference(ctx, sqlcgen.GetPaymentByMerchantAndExternalReferenceParams{
 		MerchantID:        merchantID,
 		ExternalReference: externalReference,
 	})
@@ -68,12 +75,31 @@ func (r *PaymentRepository) GetByMerchantAndExternalReference(ctx context.Contex
 }
 
 func (r *PaymentRepository) UpdateStatus(ctx context.Context, payment *domain.Payment) error {
-	_, err := r.queries.UpdatePaymentStatus(ctx, sqlcgen.UpdatePaymentStatusParams{
+	_, err := r.queries(ctx).UpdatePaymentStatus(ctx, sqlcgen.UpdatePaymentStatusParams{
 		ID:        payment.ID,
 		Status:    string(payment.Status),
 		UpdatedAt: payment.UpdatedAt,
 	})
 	return mapError(err)
+}
+
+// MarkProcessing guarda a qué proveedor se envió (providerName), la
+// referencia de esa operación (providerReference), y el paso a
+// PROCESSING, en una sola escritura (ver MarkPaymentProcessing en
+// queries/payments.sql) — se persiste ANTES de llamar al proveedor
+// externo, para que una caída a mitad de esa llamada deje todo lo
+// necesario ya guardado para poder conciliar después.
+func (r *PaymentRepository) MarkProcessing(ctx context.Context, paymentID, providerReference, providerName string, updatedAt time.Time) (*domain.Payment, error) {
+	row, err := r.queries(ctx).MarkPaymentProcessing(ctx, sqlcgen.MarkPaymentProcessingParams{
+		ID:                paymentID,
+		ProviderReference: sql.NullString{String: providerReference, Valid: true},
+		ProviderName:      sql.NullString{String: providerName, Valid: true},
+		UpdatedAt:         updatedAt,
+	})
+	if err != nil {
+		return nil, mapError(err)
+	}
+	return toDomainPayment(row), nil
 }
 
 func (r *PaymentRepository) List(ctx context.Context, filter application.PaymentFilter) ([]*domain.Payment, error) {
@@ -82,7 +108,7 @@ func (r *PaymentRepository) List(ctx context.Context, filter application.Payment
 		return nil, err
 	}
 
-	rows, err := r.queries.ListPayments(ctx, sqlcgen.ListPaymentsParams{
+	rows, err := r.queries(ctx).ListPayments(ctx, sqlcgen.ListPaymentsParams{
 		MerchantID:    merchantID,
 		Status:        nullableStatus(filter.Status),
 		PaymentMethod: nullablePaymentMethod(filter.PaymentMethod),
@@ -108,7 +134,7 @@ func (r *PaymentRepository) Count(ctx context.Context, filter application.Paymen
 		return 0, err
 	}
 
-	count, err := r.queries.CountPayments(ctx, sqlcgen.CountPaymentsParams{
+	count, err := r.queries(ctx).CountPayments(ctx, sqlcgen.CountPaymentsParams{
 		MerchantID:    merchantID,
 		Status:        nullableStatus(filter.Status),
 		PaymentMethod: nullablePaymentMethod(filter.PaymentMethod),
@@ -122,7 +148,7 @@ func (r *PaymentRepository) Count(ctx context.Context, filter application.Paymen
 }
 
 func (r *PaymentRepository) GetSummaryByMerchantID(ctx context.Context, merchantID string) (application.MerchantSummary, error) {
-	row, err := r.queries.GetMerchantSummary(ctx, merchantID)
+	row, err := r.queries(ctx).GetMerchantSummary(ctx, merchantID)
 	if err != nil {
 		return application.MerchantSummary{}, mapError(err)
 	}
@@ -185,10 +211,19 @@ func toDomainPayment(row sqlcgen.Payment) *domain.Payment {
 			Amount:   row.Amount,
 			Currency: row.Currency,
 		},
-		PaymentMethod:  domain.PaymentMethod(row.PaymentMethod),
-		Status:         domain.PaymentStatus(row.Status),
-		IdempotencyKey: row.IdempotencyKey,
-		CreatedAt:      row.CreatedAt,
-		UpdatedAt:      row.UpdatedAt,
+		PaymentMethod:     domain.PaymentMethod(row.PaymentMethod),
+		Status:            domain.PaymentStatus(row.Status),
+		IdempotencyKey:    row.IdempotencyKey,
+		ProviderReference: fromNullString(row.ProviderReference),
+		ProviderName:      fromNullString(row.ProviderName),
+		CreatedAt:         row.CreatedAt,
+		UpdatedAt:         row.UpdatedAt,
 	}
+}
+
+func fromNullString(s sql.NullString) *string {
+	if !s.Valid {
+		return nil
+	}
+	return &s.String
 }

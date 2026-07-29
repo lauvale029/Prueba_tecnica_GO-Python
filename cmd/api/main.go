@@ -36,7 +36,8 @@ func main() {
 	merchantRepo := postgres.NewMerchantRepository(db)
 	paymentRepo := postgres.NewPaymentRepository(db)
 	paymentHistoryRepo := postgres.NewPaymentStatusHistoryRepository(db)
-	paymentService := application.NewPaymentService(paymentRepo, merchantRepo, paymentHistoryRepo, locker, summaryCache)
+	uow := postgres.NewUnitOfWork(db)
+	paymentService := application.NewPaymentService(paymentRepo, merchantRepo, paymentHistoryRepo, locker, summaryCache, uow)
 	paymentHandler := transporthttp.NewPaymentHandler(paymentService)
 
 	merchantService := application.NewMerchantService(merchantRepo)

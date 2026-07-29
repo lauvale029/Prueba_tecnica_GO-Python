@@ -28,6 +28,7 @@ internal/
   infrastructure/
     postgres/              # implementación de repositorios (sqlc + pgx)
     redis/                  # idempotencia rápida y cache del resumen
+    provider/               # proveedor de pagos externo (simulado)
   transport/http/          # handlers Fiber, DTOs de request/response
   middleware/              # RequireAuth: validación de JWT en rutas protegidas
 migrations/               # migraciones SQL versionadas
@@ -141,6 +142,8 @@ erDiagram
         text payment_method
         text status
         text idempotency_key UK
+        text provider_reference UK
+        text provider_name
         timestamptz created_at
         timestamptz updated_at
     }
@@ -205,6 +208,12 @@ completo.
   mapa de transiciones permitidas) + `CanTransition`, en vez de una
   cadena de `if/else` dispersa por el código, para las reglas de
   `PaymentStatus`.
+- **Unit of Work:** `application.UnitOfWork` (patrón descrito por Martin
+  Fowler en *Patterns of Enterprise Application Architecture*) agrupa
+  varias escrituras en una sola transacción atómica — `PaymentService`
+  solo ve el puerto (`Execute(ctx, fn)`), nunca un `*sql.Tx`; la
+  implementación real vive en
+  `internal/infrastructure/postgres/unit_of_work.go` — ver "Sección 2".
 
 ## Requisitos
 
@@ -284,9 +293,12 @@ ningún sitio externo.
 ## Migraciones
 
 Las migraciones son archivos SQL versionados en `migrations/`, con un par
-`.up.sql`/`.down.sql` por cada paso (`0001_init_schema.up.sql` crea el
-esquema inicial: `merchants`, `payments`, `payment_status_history`; su
-`.down.sql` lo revierte). Se aplican con
+`.up.sql`/`.down.sql` por cada paso (`0001_init_schema` crea el esquema
+inicial: `merchants`, `payments`, `payment_status_history`;
+`0002_add_payment_provider_reference` agrega la columna
+`provider_reference`; `0003_add_payment_provider_name` agrega
+`provider_name` — ver "Sección 2"). Cada `.down.sql` revierte
+exactamente lo que su `.up.sql` creó. Se aplican con
 [`golang-migrate`](https://github.com/golang-migrate/migrate) a través de su
 imagen Docker oficial, sin necesidad de instalar nada localmente.
 
@@ -310,13 +322,14 @@ solo es válido para herramientas que corren directamente en tu máquina.
 go test ./... -v
 ```
 
-Por ahora cubre `internal/domain` (18 tests): creación válida de
+Por ahora cubre `internal/domain` (22 tests): creación válida de
 `Merchant`/`Payment`, cada validación individual fallando (nombre vacío,
 email inválido, monto ≤ 0, moneda no soportada, método de pago inválido,
 referencia externa/llave de idempotencia faltantes), la tabla completa de
-transiciones de estado válidas e inválidas, y el caso de no poder volver a
-`PENDING` desde un estado terminal. Son pruebas unitarias puras, sin base
-de datos ni HTTP de por medio.
+transiciones de estado válidas e inválidas (incluyendo `PROCESSING`/
+`UNKNOWN` — ver "Sección 2"), y el caso de no poder volver a `PENDING`
+desde un estado terminal. Son pruebas unitarias puras, sin base de datos
+ni HTTP de por medio.
 
 Los repositorios de Postgres (`internal/infrastructure/postgres`) tienen
 pruebas de integración contra una base real, separadas con el build tag
@@ -332,12 +345,16 @@ go test -tags=integration ./internal/infrastructure/postgres/... -v
 
 Cubren: creación y lectura de comercios y pagos, `ErrNotFound` cuando el
 recurso no existe, `ErrConflict` cuando se viola una restricción única
-(`document_number` duplicado, `idempotency_key` duplicada, y
-`merchant_id + external_reference` duplicados), actualización de estado,
-creación/listado del historial de estados, **listado con filtros y
-paginación** (por comercio, por estado, con `page`/`limit`), y la
-concurrencia real de 20 goroutines contra Postgres con la misma
-`Idempotency-Key`.
+(`document_number` duplicado, `idempotency_key` duplicada,
+`merchant_id + external_reference` duplicados, y `provider_reference`
+duplicada), actualización de estado, `MarkProcessing` (guarda
+`provider_reference` + paso a `PROCESSING`), creación/listado del
+historial de estados, **listado con filtros y paginación** (por
+comercio, por estado, con `page`/`limit`), la concurrencia real de 20
+goroutines contra Postgres con la misma `Idempotency-Key`, y las 2
+pruebas de atomicidad de `UnitOfWork` (revierte todo ante un fallo a
+mitad de camino, confirma todo junto en el camino feliz — ver
+"Sección 2"). 20 tests en total.
 
 `internal/application` (21 tests) prueba `MerchantService` y
 `PaymentService` con repositorios falsos en memoria: que el dominio
@@ -351,6 +368,12 @@ la misma `Idempotency-Key` converjan en un solo pago — ver la sección
 `internal/infrastructure/auth` (4 tests) prueba la emisión y validación
 de JWT en aislamiento: ida y vuelta con un secreto correcto, rechazo con
 secreto equivocado, rechazo por expiración, rechazo por token malformado.
+`internal/infrastructure/provider` (10 tests) prueba el proveedor de
+pagos simulado (sus 4 comportamientos configurables, la referencia
+desconocida, y que su mapa interno sea seguro bajo 20 goroutines
+concurrentes) y el `Registry` que resuelve proveedores por nombre
+(obtener uno registrado, error si no existe, y que varios proveedores
+coexistan sin pisarse) — ver "Sección 2".
 `internal/middleware` (5 tests) prueba `RequireAuth` como middleware
 Fiber genérico (sin el router real de por medio): sin header, header sin
 `Bearer`, token inválido, token expirado, token válido.
@@ -756,3 +779,197 @@ decidir, asumimos:
   servicio (`postgres:5432`, `redis:6379`) — la única forma de que
   `docker compose up --build` funcione de punta a punta sin pasos
   manuales adicionales.
+
+## Sección 2
+
+Resiliencia frente a proveedores externos de pago (ej. Nequi): qué pasa
+cuando la respuesta de una operación se pierde antes de que MOVA la
+guarde, cómo se evita un doble cobro en un reintento, y cómo se concilia
+después el estado real de una operación incierta.
+
+### El riesgo: aprobación fantasma / estado incierto
+
+Escenario concreto: un usuario inicia un pago, el proveedor externo lo
+aprueba de verdad, pero **antes de que MOVA guarde esa respuesta, el
+proceso se cae** (timeout, caída de red, reinicio). El usuario, sin saber
+si su pago se procesó, reintenta. Los riesgos reales de este escenario:
+
+- **Doble cobro**: si el reintento simplemente vuelve a llamar al
+  proveedor sin verificar nada, el usuario paga dos veces por la misma
+  operación — el proveedor no tiene forma de saber que es un reintento
+  si no le enviamos alguna referencia que ya conociera.
+- **Estado incierto indefinido**: sin un estado explícito para "no sé qué
+  pasó", el pago quedaría atascado en `PENDING` como si nunca se hubiera
+  intentado — perdiendo el hecho de que sí se llegó a contactar al
+  proveedor.
+- **Reconciliación tardía o inexistente**: sin un mecanismo para
+  preguntarle al proveedor "¿qué pasó con esta operación?", un pago
+  incierto nunca se resolvería solo — quedaría así para siempre, o peor,
+  alguien terminaría decidiendo su estado a mano sin la certeza real.
+
+### Estados nuevos: `PROCESSING` y `UNKNOWN`
+
+Se amplió la máquina de estados de `domain.Payment`
+(`internal/domain/payment.go`) con dos estados intermedios, sin quitar
+ninguna transición existente (`PATCH /payments/{id}/status` sigue
+funcionando exactamente igual para cambios manuales).
+
+| Desde | Hacia | Cómo se llega |
+|---|---|---|
+| `PENDING` | `PROCESSING` | Automático: justo antes de llamar al proveedor externo |
+| `PENDING` | `APPROVED` / `REJECTED` / `CANCELLED` | Manual, vía `PATCH /payments/{id}/status` (sin proveedor de por medio) |
+| `PROCESSING` | `APPROVED` / `REJECTED` | El proveedor respondió con claridad (al momento de cobrar, o después al conciliar) |
+| `PROCESSING` | `UNKNOWN` | El proveedor no respondió (timeout, caída de red) |
+| `UNKNOWN` | `APPROVED` / `REJECTED` | Se resolvió conciliando con el proveedor |
+
+Ninguna fila permite volver a un estado anterior (ej. `APPROVED → PENDING`)
+ni saltarse un paso (ej. `PENDING → UNKNOWN` directo, sin pasar por
+`PROCESSING`) — la tabla completa vive en `allowedTransitions`
+(`internal/domain/payment.go`), y **`CANCELLED` no es alcanzable desde
+`PROCESSING` ni desde `UNKNOWN` a propósito**: una vez que la operación
+se envió al proveedor, "cancelar" ya no es una decisión que MOVA pueda
+tomar unilateralmente — si el proveedor en realidad sí procesó el cobro,
+marcarlo `CANCELLED` sería falsear el registro contable. Desde esos dos
+estados, la única salida es preguntarle al proveedor qué pasó de verdad
+(conciliación) y resolver a `APPROVED` o `REJECTED` según la respuesta
+real — nunca decidir "cancelado" sin esa confirmación.
+
+- **`PROCESSING`**: la operación ya se envió al proveedor externo, la
+  respuesta todavía no se conoce. Se persiste **antes** de llamar al
+  proveedor (no después) — así, si el proceso se cae a mitad de esa
+  llamada, el pago queda con evidencia de que la operación quedó en
+  camino, no como si nunca hubiera pasado nada.
+- **`UNKNOWN`**: se le preguntó al proveedor y no hubo una respuesta
+  clara (timeout, caída de red). No es un estado terminal — la única
+  salida es conciliar con el proveedor (nunca una cancelación manual:
+  cancelar algo que en realidad sí se cobró falsearía el registro).
+
+### Identificador estable de operación (`provider_reference`)
+
+Columna nueva en `payments` (migración
+`0002_add_payment_provider_reference.up.sql`), única cuando existe,
+`NULL` hasta que el pago se envía al proveedor. Es distinta de
+`idempotency_key` (la genera el cliente de esta API) y de `id` (lo genera
+este sistema) — `provider_reference` identifica la operación de cara al
+proveedor externo.
+
+Decisión importante: **la genera MOVA, no el proveedor**, y se persiste
+junto con el paso a `PROCESSING` en una sola escritura, **antes** de
+llamar al proveedor (`PaymentRepository.MarkProcessing`). La alternativa
+— esperar a que el proveedor la devuelva en su respuesta — no serviría
+para el escenario de riesgo: si la respuesta se pierde, nunca tendríamos
+esa referencia para poder preguntar después. Generándola nosotros de
+antemano, siempre queda algo estable para conciliar, sin importar qué
+pase con la llamada al proveedor.
+
+### La abstracción del proveedor (`PaymentProvider`)
+
+Puerto nuevo en `internal/application/ports.go`, con solo dos
+operaciones:
+
+```go
+type PaymentProvider interface {
+    Charge(ctx context.Context, req ChargeRequest) (ProviderStatus, error)
+    GetStatus(ctx context.Context, providerReference string) (ProviderStatus, error)
+}
+```
+
+`ProviderStatus` tiene **tres** valores posibles (`APPROVED`, `REJECTED`,
+`PROCESSING`) — el tercero cubre el caso legítimo de que el proveedor
+mismo tampoco tenga todavía una respuesta definitiva al conciliar (no es
+un error, es "vuelve a preguntar más tarde"). Un error dedicado,
+`application.ErrProviderUnreachable`, distingue "no se pudo contactar al
+proveedor en absoluto" de una respuesta real de rechazo.
+
+La implementación (`internal/infrastructure/provider`, sin credenciales
+reales de sandbox) es un simulador con 4 comportamientos configurables
+por instancia, pensados para reproducir cada escenario de riesgo de forma
+determinista en pruebas:
+
+- `BehaviorApprove` / `BehaviorReject`: responde de inmediato.
+- `BehaviorTimeout`: `Charge` falla con `ErrProviderUnreachable`, y el
+  proveedor tampoco tiene ninguna verdad guardada al conciliar
+  (`GetStatus` devuelve `PROCESSING`).
+- `BehaviorApprovedButLost`: reproduce el escenario de riesgo central —
+  el proveedor **sí aprueba de verdad** (lo guarda en su estado interno),
+  pero `Charge` le devuelve a MOVA `ErrProviderUnreachable`, como si la
+  respuesta se hubiera perdido. `GetStatus`, después, sí revela la
+  aprobación real al conciliar — separar "lo que el proveedor sabe" de
+  "lo que nos dijo" es lo que hace posible resolver este caso.
+
+### Diseñado para más de un proveedor externo
+
+El enunciado menciona Nequi como ejemplo, pero nada en el diseño depende
+de que exista un solo proveedor — se construyó pensando en que en el
+futuro pudiera haber varios (ej. Nequi y Bre-B) operando a la vez:
+
+- **`provider_name`** (columna nueva en `payments`, migración
+  `0003_add_payment_provider_name.up.sql`) registra **cuál** proveedor
+  procesó cada pago — distinto de `provider_reference`, que identifica
+  **la operación** dentro de ese proveedor. Ambos son necesarios: con
+  varios proveedores posibles, conciliar requiere saber tanto la
+  referencia como a *quién* preguntarle por ella.
+- **`application.ProviderRegistry`** (puerto nuevo) resuelve, por
+  nombre, qué `PaymentProvider` usar:
+  ```go
+  type ProviderRegistry interface {
+      Get(providerName string) (PaymentProvider, error)
+  }
+  ```
+  `PaymentService` nunca necesita un `if providerName == "nequi"` — solo
+  le pide al registro el proveedor correspondiente, y usa la interfaz
+  genérica sin saber cuál implementación concreta hay detrás.
+- **`internal/infrastructure/provider/registry.go`** es la implementación
+  real: un mapa en memoria donde `cmd/api/main.go` registra, una sola vez
+  al arrancar, cada proveedor disponible (`registry.Register("nequi",
+  nequiProvider).Register("bre-b", brebProvider)`). Pedir un proveedor no
+  registrado devuelve `application.ErrUnknownProvider`, no un `nil`
+  silencioso.
+
+Ahora mismo solo existe un proveedor real registrado (el simulado) — el
+mecanismo de *selección* (qué regla decide cuál proveedor usar para un
+pago dado: ¿el método de pago? ¿una configuración por comercio?) todavía
+no está definido, porque no tiene sentido diseñarlo sin un segundo
+proveedor real contra el cual validarlo. Lo que sí queda resuelto desde
+ya es que agregar ese segundo proveedor, el día que exista, no requiere
+tocar `PaymentService` ni ninguna regla de negocio — solo escribir el
+adaptador nuevo y registrarlo.
+
+### Atomicidad: estado + historial en una sola transacción
+
+Antes de este cambio, `PaymentService.UpdateStatus` escribía el nuevo
+estado y la entrada de historial en dos llamadas independientes a
+Postgres — sin ninguna transacción de por medio, una caída justo entre
+ambas dejaría un pago con un estado que ningún registro de historial
+explica.
+
+Se agregó un puerto `UnitOfWork` (`internal/application/ports.go`):
+
+```go
+type UnitOfWork interface {
+    Execute(ctx context.Context, fn func(ctx context.Context) error) error
+}
+```
+
+La implementación real (`internal/infrastructure/postgres/unit_of_work.go`)
+abre una transacción de Postgres, y los repositorios de ese mismo paquete
+(`PaymentRepository`, `PaymentStatusHistoryRepository`) detectan si el
+`context.Context` que reciben trae una transacción activa — si la trae,
+la usan; si no, usan la conexión normal (ver `tx.go`). Así, `application`
+nunca se entera de que existe un `*sql.Tx` por debajo, solo ve el puerto
+`UnitOfWork`; y `PaymentService.UpdateStatus` queda:
+
+```go
+s.uow.Execute(ctx, func(txCtx context.Context) error {
+    if err := s.payments.UpdateStatus(txCtx, payment); err != nil {
+        return err
+    }
+    return s.history.Create(txCtx, history)
+})
+```
+
+Verificado con dos pruebas de integración contra Postgres real
+(`internal/infrastructure/postgres/unit_of_work_test.go`): una fuerza un
+error justo después de la primera escritura y confirma que **ambas**
+quedan revertidas (no solo la que falló), y otra confirma que el camino
+feliz persiste las dos juntas.

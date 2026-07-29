@@ -4,6 +4,7 @@ import (
 	"context"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/shopspring/decimal"
 	"github.com/stretchr/testify/require"
@@ -121,6 +122,20 @@ func (r *inMemoryPaymentRepository) UpdateStatus(_ context.Context, payment *dom
 	return nil
 }
 
+func (r *inMemoryPaymentRepository) MarkProcessing(_ context.Context, paymentID, providerReference, providerName string, updatedAt time.Time) (*domain.Payment, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	p, ok := r.byID[paymentID]
+	if !ok {
+		return nil, application.ErrNotFound
+	}
+	p.Status = domain.PaymentStatusProcessing
+	p.ProviderReference = &providerReference
+	p.ProviderName = &providerName
+	p.UpdatedAt = updatedAt
+	return p, nil
+}
+
 func (r *inMemoryPaymentRepository) rowCount() int {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -233,12 +248,24 @@ func seedMerchant(t *testing.T, repo *inMemoryMerchantRepository) *domain.Mercha
 	return merchant
 }
 
+// fakeUnitOfWork simplemente ejecuta fn con el mismo ctx: los fakes en
+// memoria no tienen una noción real de transacción (sus escrituras ya
+// son atómicas por el Mutex de cada uno), así que no hay nada que
+// revertir de verdad — lo que se prueba acá es que PaymentService llama
+// a Execute con la secuencia correcta, no la mecánica de un rollback real
+// (eso lo cubre el test de integración contra Postgres).
+type fakeUnitOfWork struct{}
+
+func (fakeUnitOfWork) Execute(ctx context.Context, fn func(ctx context.Context) error) error {
+	return fn(ctx)
+}
+
 func newPaymentServiceForTest() (*application.PaymentService, *inMemoryMerchantRepository, *inMemoryPaymentRepository, *inMemoryHistoryRepository, *inMemorySummaryCache) {
 	merchants := newInMemoryMerchantRepository()
 	payments := newInMemoryPaymentRepository()
 	history := newInMemoryHistoryRepository()
 	summaries := newInMemorySummaryCache()
-	service := application.NewPaymentService(payments, merchants, history, application.NoopIdempotencyLocker{}, summaries)
+	service := application.NewPaymentService(payments, merchants, history, application.NoopIdempotencyLocker{}, summaries, fakeUnitOfWork{})
 	return service, merchants, payments, history, summaries
 }
 
