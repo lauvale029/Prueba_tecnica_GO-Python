@@ -54,6 +54,22 @@ services:
     networks:
       - mova
 
+  reconciliation-worker:
+    build:
+      context: ./reconciliation
+    env_file:
+      - .env
+    environment:
+      # Igual que en el servicio "api" de arriba: dentro de la red de
+      # Docker "localhost" no es la API, es el propio contenedor del
+      # worker — por eso se sobrescribe con el nombre del servicio "api".
+      API_BASE_URL: http://api:8080
+    depends_on:
+      api:
+        condition: service_started
+    networks:
+      - mova
+
   swagger-ui:
     image: swaggerapi/swagger-ui
     environment:
