@@ -85,6 +85,16 @@ func (r *inMemoryPaymentRepository) Create(_ context.Context, payment *domain.Pa
 	return nil
 }
 
+// copyPaymentValue devuelve una copia independiente de p — simula lo que
+// un repositorio real de Postgres ya hace naturalmente (cada consulta
+// SQL produce una fila nueva, nunca una referencia compartida). Sin
+// esto, dos goroutines que consultan el mismo pago recibirían el MISMO
+// puntero y podrían mutarlo a la vez sin ninguna sincronización.
+func copyPaymentValue(p *domain.Payment) *domain.Payment {
+	cp := *p
+	return &cp
+}
+
 func (r *inMemoryPaymentRepository) GetByID(_ context.Context, id string) (*domain.Payment, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -92,7 +102,7 @@ func (r *inMemoryPaymentRepository) GetByID(_ context.Context, id string) (*doma
 	if !ok {
 		return nil, application.ErrNotFound
 	}
-	return p, nil
+	return copyPaymentValue(p), nil
 }
 
 func (r *inMemoryPaymentRepository) GetByIdempotencyKey(_ context.Context, key string) (*domain.Payment, error) {
@@ -102,7 +112,7 @@ func (r *inMemoryPaymentRepository) GetByIdempotencyKey(_ context.Context, key s
 	if !ok {
 		return nil, application.ErrNotFound
 	}
-	return p, nil
+	return copyPaymentValue(p), nil
 }
 
 func (r *inMemoryPaymentRepository) GetByMerchantAndExternalReference(_ context.Context, merchantID, externalReference string) (*domain.Payment, error) {
@@ -112,13 +122,24 @@ func (r *inMemoryPaymentRepository) GetByMerchantAndExternalReference(_ context.
 	if !ok {
 		return nil, application.ErrNotFound
 	}
-	return p, nil
+	return copyPaymentValue(p), nil
+}
+
+// storeConsistently guarda p en los 3 índices (byID, byIdempotencyKey,
+// byExternalRef) — necesario porque, a diferencia de antes, ya no
+// compartimos el mismo puntero entre índices: cada escritura debe
+// actualizar los 3 explícitamente para que ninguno quede con una copia
+// vieja.
+func (r *inMemoryPaymentRepository) storeConsistently(p *domain.Payment) {
+	r.byID[p.ID] = p
+	r.byIdempotencyKey[p.IdempotencyKey] = p
+	r.byExternalRef[paymentExternalRefKey(p.MerchantID, p.ExternalReference)] = p
 }
 
 func (r *inMemoryPaymentRepository) UpdateStatus(_ context.Context, payment *domain.Payment) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	r.byID[payment.ID] = payment
+	r.storeConsistently(copyPaymentValue(payment))
 	return nil
 }
 
@@ -129,11 +150,13 @@ func (r *inMemoryPaymentRepository) MarkProcessing(_ context.Context, paymentID,
 	if !ok {
 		return nil, application.ErrNotFound
 	}
-	p.Status = domain.PaymentStatusProcessing
-	p.ProviderReference = &providerReference
-	p.ProviderName = &providerName
-	p.UpdatedAt = updatedAt
-	return p, nil
+	updated := copyPaymentValue(p)
+	updated.Status = domain.PaymentStatusProcessing
+	updated.ProviderReference = &providerReference
+	updated.ProviderName = &providerName
+	updated.UpdatedAt = updatedAt
+	r.storeConsistently(updated)
+	return copyPaymentValue(updated), nil
 }
 
 func (r *inMemoryPaymentRepository) rowCount() int {
@@ -260,30 +283,103 @@ func (fakeUnitOfWork) Execute(ctx context.Context, fn func(ctx context.Context) 
 	return fn(ctx)
 }
 
+// fakeProvider es un PaymentProvider configurable por instancia — mismo
+// espíritu que provider.SimulatedProvider (infrastructure/provider), pero
+// definido acá para no hacer que los tests de application dependan de
+// infrastructure, rompiendo la regla de dependencia hexagonal.
+type fakeProviderBehavior int
+
+const (
+	fakeProviderApprove fakeProviderBehavior = iota
+	fakeProviderReject
+	fakeProviderUnreachable
+)
+
+// fakeProvider es un puntero a propósito: algunos tests cambian
+// provider.behavior a mitad de camino (para simular "el proveedor ya
+// sabe qué pasó" en un reintento) — con un value type, esa mutación no
+// se vería reflejada en la copia que el registry ya tiene guardada.
+type fakeProvider struct {
+	behavior fakeProviderBehavior
+}
+
+func (p *fakeProvider) Charge(_ context.Context, _ application.ChargeRequest) (application.ProviderStatus, error) {
+	switch p.behavior {
+	case fakeProviderReject:
+		return application.ProviderStatusRejected, nil
+	case fakeProviderUnreachable:
+		return "", application.ErrProviderUnreachable
+	default:
+		return application.ProviderStatusApproved, nil
+	}
+}
+
+func (p *fakeProvider) GetStatus(_ context.Context, _ string) (application.ProviderStatus, error) {
+	switch p.behavior {
+	case fakeProviderReject:
+		return application.ProviderStatusRejected, nil
+	case fakeProviderUnreachable:
+		return application.ProviderStatusProcessing, nil
+	default:
+		return application.ProviderStatusApproved, nil
+	}
+}
+
+// fakeProviderRegistry siempre devuelve el mismo proveedor, sin importar
+// el nombre pedido — suficiente para probar PaymentService, que hoy solo
+// usa un proveedor por defecto (ver README, Sección 2).
+type fakeProviderRegistry struct {
+	provider application.PaymentProvider
+}
+
+func (r fakeProviderRegistry) Get(_ string) (application.PaymentProvider, error) {
+	return r.provider, nil
+}
+
+const testDefaultProviderName = "test-provider"
+
+// newPaymentServiceForTest arma un PaymentService con el proveedor falso
+// en modo "aprueba de inmediato" — el comportamiento por defecto en
+// producción también (ver cmd/api/main.go). Los tests que necesiten un
+// comportamiento distinto (rechazo, proveedor inalcanzable) usan
+// newPaymentServiceWithProvider directamente.
 func newPaymentServiceForTest() (*application.PaymentService, *inMemoryMerchantRepository, *inMemoryPaymentRepository, *inMemoryHistoryRepository, *inMemorySummaryCache) {
+	service, merchants, payments, history, summaries, _ := newPaymentServiceWithProvider(fakeProviderApprove)
+	return service, merchants, payments, history, summaries
+}
+
+func newPaymentServiceWithProvider(behavior fakeProviderBehavior) (*application.PaymentService, *inMemoryMerchantRepository, *inMemoryPaymentRepository, *inMemoryHistoryRepository, *inMemorySummaryCache, *fakeProvider) {
 	merchants := newInMemoryMerchantRepository()
 	payments := newInMemoryPaymentRepository()
 	history := newInMemoryHistoryRepository()
 	summaries := newInMemorySummaryCache()
-	service := application.NewPaymentService(payments, merchants, history, application.NoopIdempotencyLocker{}, summaries, fakeUnitOfWork{})
-	return service, merchants, payments, history, summaries
+	provider := &fakeProvider{behavior: behavior}
+	registry := fakeProviderRegistry{provider: provider}
+	service := application.NewPaymentService(payments, merchants, history, application.NoopIdempotencyLocker{}, summaries, fakeUnitOfWork{}, registry, testDefaultProviderName)
+	return service, merchants, payments, history, summaries, provider
 }
 
 func TestPaymentService_Create_Valid(t *testing.T) {
 	service, merchants, _, _, _ := newPaymentServiceForTest()
 	merchant := seedMerchant(t, merchants)
 
-	payment, err := service.Create(context.Background(), merchant.ID, "ORDER-1", decimal.NewFromInt(1000), "COP", domain.PaymentMethodQR, "key-1")
+	payment, err := service.Create(context.Background(), merchant.ID, "ORDER-1", decimal.NewFromInt(1000), "COP", domain.PaymentMethodQR, "key-1", "test-user")
 
 	require.NoError(t, err)
-	require.Equal(t, domain.PaymentStatusPending, payment.Status)
+	// El proveedor falso por defecto aprueba de inmediato: Create ya no
+	// deja el pago en PENDING, lo resuelve contra el proveedor antes de
+	// devolverlo (ver README, Sección 2).
+	require.Equal(t, domain.PaymentStatusApproved, payment.Status)
+	require.NotNil(t, payment.ProviderReference)
+	require.NotNil(t, payment.ProviderName)
+	require.Equal(t, testDefaultProviderName, *payment.ProviderName)
 }
 
 func TestPaymentService_Create_MissingIdempotencyKey(t *testing.T) {
 	service, merchants, _, _, _ := newPaymentServiceForTest()
 	merchant := seedMerchant(t, merchants)
 
-	_, err := service.Create(context.Background(), merchant.ID, "ORDER-1", decimal.NewFromInt(1000), "COP", domain.PaymentMethodQR, "")
+	_, err := service.Create(context.Background(), merchant.ID, "ORDER-1", decimal.NewFromInt(1000), "COP", domain.PaymentMethodQR, "", "test-user")
 
 	require.ErrorIs(t, err, domain.ErrMissingIdempotencyKey)
 }
@@ -291,7 +387,7 @@ func TestPaymentService_Create_MissingIdempotencyKey(t *testing.T) {
 func TestPaymentService_Create_MerchantNotFound(t *testing.T) {
 	service, _, _, _, _ := newPaymentServiceForTest()
 
-	_, err := service.Create(context.Background(), "id-inventado", "ORDER-1", decimal.NewFromInt(1000), "COP", domain.PaymentMethodQR, "key-1")
+	_, err := service.Create(context.Background(), "id-inventado", "ORDER-1", decimal.NewFromInt(1000), "COP", domain.PaymentMethodQR, "key-1", "test-user")
 
 	require.ErrorIs(t, err, application.ErrNotFound)
 }
@@ -301,10 +397,10 @@ func TestPaymentService_Create_IdempotentReplay(t *testing.T) {
 	merchant := seedMerchant(t, merchants)
 	key := "key-1"
 
-	first, err := service.Create(context.Background(), merchant.ID, "ORDER-1", decimal.NewFromInt(1000), "COP", domain.PaymentMethodQR, key)
+	first, err := service.Create(context.Background(), merchant.ID, "ORDER-1", decimal.NewFromInt(1000), "COP", domain.PaymentMethodQR, key, "test-user")
 	require.NoError(t, err)
 
-	second, err := service.Create(context.Background(), merchant.ID, "ORDER-1", decimal.NewFromInt(1000), "COP", domain.PaymentMethodQR, key)
+	second, err := service.Create(context.Background(), merchant.ID, "ORDER-1", decimal.NewFromInt(1000), "COP", domain.PaymentMethodQR, key, "test-user")
 	require.NoError(t, err)
 
 	require.Equal(t, first.ID, second.ID)
@@ -314,11 +410,56 @@ func TestPaymentService_Create_DuplicateExternalReference(t *testing.T) {
 	service, merchants, _, _, _ := newPaymentServiceForTest()
 	merchant := seedMerchant(t, merchants)
 
-	_, err := service.Create(context.Background(), merchant.ID, "ORDER-1", decimal.NewFromInt(1000), "COP", domain.PaymentMethodQR, "key-1")
+	_, err := service.Create(context.Background(), merchant.ID, "ORDER-1", decimal.NewFromInt(1000), "COP", domain.PaymentMethodQR, "key-1", "test-user")
 	require.NoError(t, err)
 
-	_, err = service.Create(context.Background(), merchant.ID, "ORDER-1", decimal.NewFromInt(2000), "COP", domain.PaymentMethodCard, "key-2")
+	_, err = service.Create(context.Background(), merchant.ID, "ORDER-1", decimal.NewFromInt(2000), "COP", domain.PaymentMethodCard, "key-2", "test-user")
 	require.ErrorIs(t, err, application.ErrConflict)
+}
+
+func TestPaymentService_Create_ProviderRejects(t *testing.T) {
+	service, merchants, _, _, _, _ := newPaymentServiceWithProvider(fakeProviderReject)
+	merchant := seedMerchant(t, merchants)
+
+	payment, err := service.Create(context.Background(), merchant.ID, "ORDER-1", decimal.NewFromInt(1000), "COP", domain.PaymentMethodQR, "key-1", "test-user")
+
+	require.NoError(t, err)
+	require.Equal(t, domain.PaymentStatusRejected, payment.Status)
+}
+
+func TestPaymentService_Create_ProviderUnreachable_MarksUnknown(t *testing.T) {
+	service, merchants, _, _, _, _ := newPaymentServiceWithProvider(fakeProviderUnreachable)
+	merchant := seedMerchant(t, merchants)
+
+	payment, err := service.Create(context.Background(), merchant.ID, "ORDER-1", decimal.NewFromInt(1000), "COP", domain.PaymentMethodQR, "key-1", "test-user")
+
+	require.NoError(t, err)
+	require.Equal(t, domain.PaymentStatusUnknown, payment.Status)
+	require.NotNil(t, payment.ProviderReference, "la referencia debe quedar guardada aunque el proveedor no haya respondido")
+}
+
+// TestPaymentService_Create_RetryReconciles reproduce el escenario
+// central del riesgo documentado: un primer intento queda en UNKNOWN
+// (el proveedor no respondió), y un reintento con la MISMA
+// Idempotency-Key no vuelve a cobrar — concilia con el proveedor y
+// resuelve el pago existente.
+func TestPaymentService_Create_RetryReconciles(t *testing.T) {
+	service, merchants, _, _, _, provider := newPaymentServiceWithProvider(fakeProviderUnreachable)
+	merchant := seedMerchant(t, merchants)
+
+	first, err := service.Create(context.Background(), merchant.ID, "ORDER-1", decimal.NewFromInt(1000), "COP", domain.PaymentMethodQR, "key-1", "test-user")
+	require.NoError(t, err)
+	require.Equal(t, domain.PaymentStatusUnknown, first.Status)
+
+	// El proveedor, con el tiempo, sí sabe qué pasó — cambiamos su
+	// comportamiento para simular eso antes del reintento.
+	provider.behavior = fakeProviderApprove
+
+	second, err := service.Create(context.Background(), merchant.ID, "ORDER-1", decimal.NewFromInt(1000), "COP", domain.PaymentMethodQR, "key-1", "test-user")
+
+	require.NoError(t, err)
+	require.Equal(t, first.ID, second.ID, "el reintento nunca crea un pago nuevo")
+	require.Equal(t, domain.PaymentStatusApproved, second.Status, "el reintento debió conciliar, no volver a cobrar")
 }
 
 // TestPaymentService_Create_Concurrent lanza muchas goroutines a la vez
@@ -341,7 +482,7 @@ func TestPaymentService_Create_Concurrent(t *testing.T) {
 		wg.Add(1)
 		go func(i int) {
 			defer wg.Done()
-			payment, err := service.Create(context.Background(), merchant.ID, "ORDER-CONCURRENT", decimal.NewFromInt(1000), "COP", domain.PaymentMethodQR, idempotencyKey)
+			payment, err := service.Create(context.Background(), merchant.ID, "ORDER-CONCURRENT", decimal.NewFromInt(1000), "COP", domain.PaymentMethodQR, idempotencyKey, "test-user")
 			results[i] = payment
 			errs[i] = err
 		}(i)
@@ -360,29 +501,38 @@ func TestPaymentService_Create_Concurrent(t *testing.T) {
 	require.Equal(t, 1, payments.rowCount(), "no debe haberse creado más de un pago con la misma Idempotency-Key")
 }
 
+// TestPaymentService_UpdateStatus_Valid usa un proveedor inalcanzable a
+// propósito: así el pago queda en UNKNOWN tras Create (en vez de
+// resolverse solo), dejando algo pendiente de un cambio manual real que
+// probar — UpdateStatus sigue permitiendo resolver UNKNOWN a mano,
+// además de la conciliación automática.
 func TestPaymentService_UpdateStatus_Valid(t *testing.T) {
-	service, merchants, _, history, _ := newPaymentServiceForTest()
+	service, merchants, _, history, _, _ := newPaymentServiceWithProvider(fakeProviderUnreachable)
 	merchant := seedMerchant(t, merchants)
-	payment, err := service.Create(context.Background(), merchant.ID, "ORDER-1", decimal.NewFromInt(1000), "COP", domain.PaymentMethodQR, "key-1")
+	payment, err := service.Create(context.Background(), merchant.ID, "ORDER-1", decimal.NewFromInt(1000), "COP", domain.PaymentMethodQR, "key-1", "test-user")
 	require.NoError(t, err)
+	require.Equal(t, domain.PaymentStatusUnknown, payment.Status)
 
 	updated, err := service.UpdateStatus(context.Background(), payment.ID, domain.PaymentStatusApproved, "pago confirmado", "test-user")
 
 	require.NoError(t, err)
 	require.Equal(t, domain.PaymentStatusApproved, updated.Status)
 
+	// Create ya generó sus propias entradas (PENDING→PROCESSING→UNKNOWN);
+	// esta prueba se enfoca en la ÚLTIMA, la que corresponde a este
+	// UpdateStatus manual.
 	entries, err := history.ListByPaymentID(context.Background(), payment.ID)
 	require.NoError(t, err)
-	require.Len(t, entries, 1)
-	require.Equal(t, domain.PaymentStatusPending, entries[0].PreviousStatus)
-	require.Equal(t, domain.PaymentStatusApproved, entries[0].NewStatus)
-	require.Equal(t, "test-user", entries[0].ChangedBy)
+	last := entries[len(entries)-1]
+	require.Equal(t, domain.PaymentStatusUnknown, last.PreviousStatus)
+	require.Equal(t, domain.PaymentStatusApproved, last.NewStatus)
+	require.Equal(t, "test-user", last.ChangedBy)
 }
 
 func TestPaymentService_UpdateStatus_InvalidTransition(t *testing.T) {
-	service, merchants, _, _, _ := newPaymentServiceForTest()
+	service, merchants, _, _, _, _ := newPaymentServiceWithProvider(fakeProviderUnreachable)
 	merchant := seedMerchant(t, merchants)
-	payment, err := service.Create(context.Background(), merchant.ID, "ORDER-1", decimal.NewFromInt(1000), "COP", domain.PaymentMethodQR, "key-1")
+	payment, err := service.Create(context.Background(), merchant.ID, "ORDER-1", decimal.NewFromInt(1000), "COP", domain.PaymentMethodQR, "key-1", "test-user")
 	require.NoError(t, err)
 	_, err = service.UpdateStatus(context.Background(), payment.ID, domain.PaymentStatusApproved, "ok", "test-user")
 	require.NoError(t, err)
@@ -411,7 +561,7 @@ func TestPaymentService_History_PaymentNotFound(t *testing.T) {
 func TestPaymentService_List_DefaultsPageAndLimit(t *testing.T) {
 	service, merchants, _, _, _ := newPaymentServiceForTest()
 	merchant := seedMerchant(t, merchants)
-	_, err := service.Create(context.Background(), merchant.ID, "ORDER-1", decimal.NewFromInt(1000), "COP", domain.PaymentMethodQR, "key-1")
+	_, err := service.Create(context.Background(), merchant.ID, "ORDER-1", decimal.NewFromInt(1000), "COP", domain.PaymentMethodQR, "key-1", "test-user")
 	require.NoError(t, err)
 
 	payments, total, err := service.List(context.Background(), application.PaymentFilter{})
@@ -437,17 +587,23 @@ func TestPaymentService_Summary_MerchantNotFound(t *testing.T) {
 	require.ErrorIs(t, err, application.ErrNotFound)
 }
 
+// TestPaymentService_Summary_ComputesFromRepository siembra los pagos
+// directo en el repositorio falso (sin pasar por Create/el proveedor):
+// lo que esta prueba verifica es el cálculo del resumen en sí, no el
+// flujo de creación — que ya tiene sus propias pruebas dedicadas.
 func TestPaymentService_Summary_ComputesFromRepository(t *testing.T) {
-	service, merchants, _, _, _ := newPaymentServiceForTest()
+	service, merchants, payments, _, _ := newPaymentServiceForTest()
 	merchant := seedMerchant(t, merchants)
+	ctx := context.Background()
 
-	approved, err := service.Create(context.Background(), merchant.ID, "ORDER-1", decimal.NewFromInt(1000), "COP", domain.PaymentMethodQR, "key-1")
+	approved, err := domain.NewPayment(merchant.ID, "ORDER-1", decimal.NewFromInt(1000), "COP", domain.PaymentMethodQR, "key-1")
 	require.NoError(t, err)
-	_, err = service.UpdateStatus(context.Background(), approved.ID, domain.PaymentStatusApproved, "ok", "test-user")
-	require.NoError(t, err)
+	require.NoError(t, approved.ChangeStatus(domain.PaymentStatusApproved))
+	require.NoError(t, payments.Create(ctx, approved))
 
-	_, err = service.Create(context.Background(), merchant.ID, "ORDER-2", decimal.NewFromInt(500), "COP", domain.PaymentMethodQR, "key-2")
+	pending, err := domain.NewPayment(merchant.ID, "ORDER-2", decimal.NewFromInt(500), "COP", domain.PaymentMethodQR, "key-2")
 	require.NoError(t, err)
+	require.NoError(t, payments.Create(ctx, pending))
 
 	summary, err := service.Summary(context.Background(), merchant.ID)
 
@@ -461,7 +617,7 @@ func TestPaymentService_Summary_ComputesFromRepository(t *testing.T) {
 func TestPaymentService_Summary_UsesCacheOnSecondCall(t *testing.T) {
 	service, merchants, _, _, cache := newPaymentServiceForTest()
 	merchant := seedMerchant(t, merchants)
-	_, err := service.Create(context.Background(), merchant.ID, "ORDER-1", decimal.NewFromInt(1000), "COP", domain.PaymentMethodQR, "key-1")
+	_, err := service.Create(context.Background(), merchant.ID, "ORDER-1", decimal.NewFromInt(1000), "COP", domain.PaymentMethodQR, "key-1", "test-user")
 	require.NoError(t, err)
 
 	require.False(t, cache.has(merchant.ID), "no debe haber nada en cache antes de la primera consulta")
@@ -480,9 +636,9 @@ func TestPaymentService_Summary_UsesCacheOnSecondCall(t *testing.T) {
 }
 
 func TestPaymentService_UpdateStatus_InvalidatesSummaryCache(t *testing.T) {
-	service, merchants, _, _, cache := newPaymentServiceForTest()
+	service, merchants, _, _, cache, _ := newPaymentServiceWithProvider(fakeProviderUnreachable)
 	merchant := seedMerchant(t, merchants)
-	payment, err := service.Create(context.Background(), merchant.ID, "ORDER-1", decimal.NewFromInt(1000), "COP", domain.PaymentMethodQR, "key-1")
+	payment, err := service.Create(context.Background(), merchant.ID, "ORDER-1", decimal.NewFromInt(1000), "COP", domain.PaymentMethodQR, "key-1", "test-user")
 	require.NoError(t, err)
 
 	_, err = service.Summary(context.Background(), merchant.ID)

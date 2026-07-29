@@ -115,6 +115,7 @@ func (h *PaymentHandler) Create(c *fiber.Ctx) error {
 		req.Currency,
 		domain.PaymentMethod(req.PaymentMethod),
 		idempotencyKey,
+		changedBy(c),
 	)
 	if err != nil {
 		return respondPaymentCreateError(c, err)
@@ -234,6 +235,20 @@ func (h *PaymentHandler) UpdateStatus(c *fiber.Ctx) error {
 		return respondPaymentStatusError(c, err)
 	}
 
+	return c.JSON(toPaymentResponse(payment))
+}
+
+// Reconcile maneja POST /api/v1/payments/{payment_id}/reconcile: le
+// pregunta al proveedor externo el estado real de un pago en
+// PROCESSING/UNKNOWN (ver README, Sección 2). Pensado para que el worker
+// de conciliación en Python lo dispare sobre pagos atascados por
+// demasiado tiempo — si el pago ya está resuelto, lo devuelve tal cual,
+// sin error.
+func (h *PaymentHandler) Reconcile(c *fiber.Ctx) error {
+	payment, err := h.service.Reconcile(c.Context(), c.Params("payment_id"), changedBy(c))
+	if err != nil {
+		return respondPaymentLookupError(c, err)
+	}
 	return c.JSON(toPaymentResponse(payment))
 }
 

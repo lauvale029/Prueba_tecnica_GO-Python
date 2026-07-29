@@ -97,6 +97,16 @@ func (f *fakePaymentRepository) Create(_ context.Context, payment *domain.Paymen
 	return nil
 }
 
+// copyPaymentValue devuelve una copia independiente de p — simula lo que
+// un repositorio real de Postgres ya hace naturalmente (cada consulta
+// SQL produce una fila nueva, nunca una referencia compartida). Sin
+// esto, dos goroutines que consultan el mismo pago recibirían el MISMO
+// puntero y podrían mutarlo a la vez sin ninguna sincronización.
+func copyPaymentValue(p *domain.Payment) *domain.Payment {
+	cp := *p
+	return &cp
+}
+
 func (f *fakePaymentRepository) GetByID(_ context.Context, id string) (*domain.Payment, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -105,7 +115,7 @@ func (f *fakePaymentRepository) GetByID(_ context.Context, id string) (*domain.P
 	if !ok {
 		return nil, application.ErrNotFound
 	}
-	return payment, nil
+	return copyPaymentValue(payment), nil
 }
 
 func (f *fakePaymentRepository) GetByIdempotencyKey(_ context.Context, idempotencyKey string) (*domain.Payment, error) {
@@ -116,7 +126,7 @@ func (f *fakePaymentRepository) GetByIdempotencyKey(_ context.Context, idempoten
 	if !ok {
 		return nil, application.ErrNotFound
 	}
-	return payment, nil
+	return copyPaymentValue(payment), nil
 }
 
 func (f *fakePaymentRepository) GetByMerchantAndExternalReference(_ context.Context, merchantID, externalReference string) (*domain.Payment, error) {
@@ -127,14 +137,23 @@ func (f *fakePaymentRepository) GetByMerchantAndExternalReference(_ context.Cont
 	if !ok {
 		return nil, application.ErrNotFound
 	}
-	return payment, nil
+	return copyPaymentValue(payment), nil
+}
+
+// storeConsistently guarda payment en los 3 índices — necesario porque
+// ya no compartimos el mismo puntero entre índices (ver
+// copyPaymentValue): cada escritura debe actualizar los 3 explícitamente.
+func (f *fakePaymentRepository) storeConsistently(payment *domain.Payment) {
+	f.byID[payment.ID] = payment
+	f.byIdempotencyKey[payment.IdempotencyKey] = payment
+	f.byExternalRefKey[externalRefKey(payment.MerchantID, payment.ExternalReference)] = payment
 }
 
 func (f *fakePaymentRepository) UpdateStatus(_ context.Context, payment *domain.Payment) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 
-	f.byID[payment.ID] = payment
+	f.storeConsistently(copyPaymentValue(payment))
 	return nil
 }
 
@@ -146,11 +165,13 @@ func (f *fakePaymentRepository) MarkProcessing(_ context.Context, paymentID, pro
 	if !ok {
 		return nil, application.ErrNotFound
 	}
-	payment.Status = domain.PaymentStatusProcessing
-	payment.ProviderReference = &providerReference
-	payment.ProviderName = &providerName
-	payment.UpdatedAt = updatedAt
-	return payment, nil
+	updated := copyPaymentValue(payment)
+	updated.Status = domain.PaymentStatusProcessing
+	updated.ProviderReference = &providerReference
+	updated.ProviderName = &providerName
+	updated.UpdatedAt = updatedAt
+	f.storeConsistently(updated)
+	return copyPaymentValue(updated), nil
 }
 
 // List/Count sí filtran de verdad (a diferencia del fake equivalente en
@@ -271,6 +292,7 @@ type testApp struct {
 	payments  *fakePaymentRepository
 	history   *fakeHistoryRepository
 	token     string
+	provider  *fakeProvider
 }
 
 // test envía req a través de la app añadiendo antes el header
@@ -288,12 +310,65 @@ func (fakeUnitOfWork) Execute(ctx context.Context, fn func(ctx context.Context) 
 	return fn(ctx)
 }
 
+// fakeProvider es configurable por instancia — el comportamiento por
+// defecto (setupApp) aprueba de inmediato; setupAppWithProviderBehavior
+// permite a un test puntual usar uno que no resuelve nada (para poder
+// seguir probando la transición manual PENDING/UNKNOWN→APPROVED vía
+// PATCH /status, sin que el proveedor se adelante). Este paquete prueba
+// el cableado HTTP, no las reglas de negocio del proveedor en sí (esas
+// tienen su propia cobertura en internal/application y
+// internal/infrastructure/provider).
+type fakeProviderBehavior int
+
+const (
+	fakeProviderApprove fakeProviderBehavior = iota
+	fakeProviderUnreachable
+)
+
+// fakeProvider es un puntero a propósito: algunos tests cambian
+// provider.behavior a mitad de camino (para simular "el proveedor ya
+// sabe qué pasó" antes de conciliar) — con un value type, esa mutación
+// no se vería reflejada en la copia que el registry ya tiene guardada.
+type fakeProvider struct {
+	behavior fakeProviderBehavior
+}
+
+func (p *fakeProvider) Charge(_ context.Context, _ application.ChargeRequest) (application.ProviderStatus, error) {
+	if p.behavior == fakeProviderUnreachable {
+		return "", application.ErrProviderUnreachable
+	}
+	return application.ProviderStatusApproved, nil
+}
+
+func (p *fakeProvider) GetStatus(_ context.Context, _ string) (application.ProviderStatus, error) {
+	if p.behavior == fakeProviderUnreachable {
+		return application.ProviderStatusProcessing, nil
+	}
+	return application.ProviderStatusApproved, nil
+}
+
+type fakeProviderRegistry struct {
+	provider *fakeProvider
+}
+
+func (r fakeProviderRegistry) Get(_ string) (application.PaymentProvider, error) {
+	return r.provider, nil
+}
+
+const testDefaultProviderName = "test-provider"
+
 func setupApp() testApp {
+	return setupAppWithProviderBehavior(fakeProviderApprove)
+}
+
+func setupAppWithProviderBehavior(behavior fakeProviderBehavior) testApp {
 	merchantRepo := newFakeMerchantRepository()
 	paymentRepo := newFakePaymentRepository()
 	historyRepo := newFakeHistoryRepository()
 
-	paymentService := application.NewPaymentService(paymentRepo, merchantRepo, historyRepo, application.NoopIdempotencyLocker{}, application.NoopSummaryCache{}, fakeUnitOfWork{})
+	provider := &fakeProvider{behavior: behavior}
+	registry := fakeProviderRegistry{provider: provider}
+	paymentService := application.NewPaymentService(paymentRepo, merchantRepo, historyRepo, application.NoopIdempotencyLocker{}, application.NoopSummaryCache{}, fakeUnitOfWork{}, registry, testDefaultProviderName)
 	paymentHandler := transporthttp.NewPaymentHandler(paymentService)
 
 	merchantService := application.NewMerchantService(merchantRepo)
@@ -312,5 +387,6 @@ func setupApp() testApp {
 		payments:  paymentRepo,
 		history:   historyRepo,
 		token:     token,
+		provider:  provider,
 	}
 }

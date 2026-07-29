@@ -27,6 +27,7 @@ func NewRouter(merchantHandler *MerchantHandler, paymentHandler *PaymentHandler,
 	protected.Get("/payments/:payment_id", paymentHandler.Get)
 	protected.Patch("/payments/:payment_id/status", paymentHandler.UpdateStatus)
 	protected.Get("/payments/:payment_id/history", paymentHandler.History)
+	protected.Post("/payments/:payment_id/reconcile", paymentHandler.Reconcile)
 
 	return app
 }
