@@ -6,6 +6,7 @@ import (
 	"context"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/shopspring/decimal"
@@ -162,6 +163,55 @@ func TestPaymentRepository_UpdateStatus(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, domain.PaymentStatusApproved, found.Status)
 }
+
+func TestPaymentRepository_MarkProcessing(t *testing.T) {
+	db := testDB(t)
+	merchant := createTestMerchant(t, db)
+	repo := postgres.NewPaymentRepository(db)
+	ctx := context.Background()
+
+	payment := newTestPayment(t, merchant.ID, "key-"+uuid.New().String())
+	require.NoError(t, repo.Create(ctx, payment))
+	require.Nil(t, payment.ProviderReference)
+	require.Nil(t, payment.ProviderName)
+
+	providerRef := uuid.New().String()
+	updated, err := repo.MarkProcessing(ctx, payment.ID, providerRef, "simulated", time.Now().UTC())
+	require.NoError(t, err)
+	require.Equal(t, domain.PaymentStatusProcessing, updated.Status)
+	require.NotNil(t, updated.ProviderReference)
+	require.Equal(t, providerRef, *updated.ProviderReference)
+	require.NotNil(t, updated.ProviderName)
+	require.Equal(t, "simulated", *updated.ProviderName)
+
+	found, err := repo.GetByID(ctx, payment.ID)
+	require.NoError(t, err)
+	require.Equal(t, domain.PaymentStatusProcessing, found.Status)
+	require.NotNil(t, found.ProviderReference)
+	require.Equal(t, providerRef, *found.ProviderReference)
+	require.NotNil(t, found.ProviderName)
+	require.Equal(t, "simulated", *found.ProviderName)
+}
+
+func TestPaymentRepository_MarkProcessing_DuplicateProviderReference(t *testing.T) {
+	db := testDB(t)
+	merchant := createTestMerchant(t, db)
+	repo := postgres.NewPaymentRepository(db)
+	ctx := context.Background()
+
+	sharedRef := uuid.New().String()
+
+	first := newTestPayment(t, merchant.ID, "key-"+uuid.New().String())
+	require.NoError(t, repo.Create(ctx, first))
+	_, err := repo.MarkProcessing(ctx, first.ID, sharedRef, "simulated", time.Now().UTC())
+	require.NoError(t, err)
+
+	second := newTestPayment(t, merchant.ID, "key-"+uuid.New().String())
+	require.NoError(t, repo.Create(ctx, second))
+	_, err = repo.MarkProcessing(ctx, second.ID, sharedRef, "simulated", time.Now().UTC())
+	require.ErrorIs(t, err, application.ErrConflict)
+}
+
 func TestPaymentRepository_ListAndCount_FilterByMerchant(t *testing.T) {
 	db := testDB(t)
 	merchantA := createTestMerchant(t, db)

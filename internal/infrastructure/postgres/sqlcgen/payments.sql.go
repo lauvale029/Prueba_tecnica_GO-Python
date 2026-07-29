@@ -50,7 +50,7 @@ INSERT INTO payments (
     payment_method, status, idempotency_key, created_at, updated_at
 )
 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
-RETURNING id, merchant_id, external_reference, amount, currency, payment_method, status, idempotency_key, created_at, updated_at
+RETURNING id, merchant_id, external_reference, amount, currency, payment_method, status, idempotency_key, created_at, updated_at, provider_reference, provider_name
 `
 
 type CreatePaymentParams struct {
@@ -91,6 +91,8 @@ func (q *Queries) CreatePayment(ctx context.Context, arg CreatePaymentParams) (P
 		&i.IdempotencyKey,
 		&i.CreatedAt,
 		&i.UpdatedAt,
+		&i.ProviderReference,
+		&i.ProviderName,
 	)
 	return i, err
 }
@@ -128,7 +130,7 @@ func (q *Queries) GetMerchantSummary(ctx context.Context, merchantID string) (Ge
 }
 
 const getPaymentByID = `-- name: GetPaymentByID :one
-SELECT id, merchant_id, external_reference, amount, currency, payment_method, status, idempotency_key, created_at, updated_at FROM payments
+SELECT id, merchant_id, external_reference, amount, currency, payment_method, status, idempotency_key, created_at, updated_at, provider_reference, provider_name FROM payments
 WHERE id = $1
 `
 
@@ -146,12 +148,14 @@ func (q *Queries) GetPaymentByID(ctx context.Context, id string) (Payment, error
 		&i.IdempotencyKey,
 		&i.CreatedAt,
 		&i.UpdatedAt,
+		&i.ProviderReference,
+		&i.ProviderName,
 	)
 	return i, err
 }
 
 const getPaymentByIdempotencyKey = `-- name: GetPaymentByIdempotencyKey :one
-SELECT id, merchant_id, external_reference, amount, currency, payment_method, status, idempotency_key, created_at, updated_at FROM payments
+SELECT id, merchant_id, external_reference, amount, currency, payment_method, status, idempotency_key, created_at, updated_at, provider_reference, provider_name FROM payments
 WHERE idempotency_key = $1
 `
 
@@ -169,12 +173,14 @@ func (q *Queries) GetPaymentByIdempotencyKey(ctx context.Context, idempotencyKey
 		&i.IdempotencyKey,
 		&i.CreatedAt,
 		&i.UpdatedAt,
+		&i.ProviderReference,
+		&i.ProviderName,
 	)
 	return i, err
 }
 
 const getPaymentByMerchantAndExternalReference = `-- name: GetPaymentByMerchantAndExternalReference :one
-SELECT id, merchant_id, external_reference, amount, currency, payment_method, status, idempotency_key, created_at, updated_at FROM payments
+SELECT id, merchant_id, external_reference, amount, currency, payment_method, status, idempotency_key, created_at, updated_at, provider_reference, provider_name FROM payments
 WHERE merchant_id = $1 AND external_reference = $2
 `
 
@@ -197,12 +203,14 @@ func (q *Queries) GetPaymentByMerchantAndExternalReference(ctx context.Context, 
 		&i.IdempotencyKey,
 		&i.CreatedAt,
 		&i.UpdatedAt,
+		&i.ProviderReference,
+		&i.ProviderName,
 	)
 	return i, err
 }
 
 const listPayments = `-- name: ListPayments :many
-SELECT id, merchant_id, external_reference, amount, currency, payment_method, status, idempotency_key, created_at, updated_at FROM payments
+SELECT id, merchant_id, external_reference, amount, currency, payment_method, status, idempotency_key, created_at, updated_at, provider_reference, provider_name FROM payments
 WHERE ($1::uuid IS NULL OR merchant_id = $1)
   AND ($2::text IS NULL OR status = $2)
   AND ($3::text IS NULL OR payment_method = $3)
@@ -250,6 +258,8 @@ func (q *Queries) ListPayments(ctx context.Context, arg ListPaymentsParams) ([]P
 			&i.IdempotencyKey,
 			&i.CreatedAt,
 			&i.UpdatedAt,
+			&i.ProviderReference,
+			&i.ProviderName,
 		); err != nil {
 			return nil, err
 		}
@@ -264,11 +274,56 @@ func (q *Queries) ListPayments(ctx context.Context, arg ListPaymentsParams) ([]P
 	return items, nil
 }
 
+const markPaymentProcessing = `-- name: MarkPaymentProcessing :one
+UPDATE payments
+SET status = 'PROCESSING', provider_reference = $2, provider_name = $3, updated_at = $4
+WHERE id = $1
+RETURNING id, merchant_id, external_reference, amount, currency, payment_method, status, idempotency_key, created_at, updated_at, provider_reference, provider_name
+`
+
+type MarkPaymentProcessingParams struct {
+	ID                string
+	ProviderReference sql.NullString
+	ProviderName      sql.NullString
+	UpdatedAt         time.Time
+}
+
+// Guarda a qué proveedor se envió (provider_name), la referencia de esa
+// operación (provider_reference), y el paso a PROCESSING, en una sola
+// escritura ANTES de llamar al proveedor externo: si el proceso se cae
+// justo después de esta escritura y antes de recibir la respuesta del
+// proveedor, ya queda todo lo necesario guardado para poder conciliar
+// luego (incluyendo con cuál proveedor había que conciliar).
+func (q *Queries) MarkPaymentProcessing(ctx context.Context, arg MarkPaymentProcessingParams) (Payment, error) {
+	row := q.db.QueryRowContext(ctx, markPaymentProcessing,
+		arg.ID,
+		arg.ProviderReference,
+		arg.ProviderName,
+		arg.UpdatedAt,
+	)
+	var i Payment
+	err := row.Scan(
+		&i.ID,
+		&i.MerchantID,
+		&i.ExternalReference,
+		&i.Amount,
+		&i.Currency,
+		&i.PaymentMethod,
+		&i.Status,
+		&i.IdempotencyKey,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+		&i.ProviderReference,
+		&i.ProviderName,
+	)
+	return i, err
+}
+
 const updatePaymentStatus = `-- name: UpdatePaymentStatus :one
 UPDATE payments
 SET status = $2, updated_at = $3
 WHERE id = $1
-RETURNING id, merchant_id, external_reference, amount, currency, payment_method, status, idempotency_key, created_at, updated_at
+RETURNING id, merchant_id, external_reference, amount, currency, payment_method, status, idempotency_key, created_at, updated_at, provider_reference, provider_name
 `
 
 type UpdatePaymentStatusParams struct {
@@ -291,6 +346,8 @@ func (q *Queries) UpdatePaymentStatus(ctx context.Context, arg UpdatePaymentStat
 		&i.IdempotencyKey,
 		&i.CreatedAt,
 		&i.UpdatedAt,
+		&i.ProviderReference,
+		&i.ProviderName,
 	)
 	return i, err
 }

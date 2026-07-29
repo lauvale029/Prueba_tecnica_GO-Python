@@ -31,6 +31,15 @@ type PaymentFilter struct {
 	Limit         int
 }
 
+// UnitOfWork agrupa varias escrituras en una sola transacción atómica:
+// si fn devuelve error, todo se revierte; si no, todo se confirma junto.
+// Los repositorios que fn use deben recibir el ctx que Execute les pasa
+// (no el original), para que sus escrituras participen de la misma
+// transacción — ver internal/infrastructure/postgres/unit_of_work.go.
+type UnitOfWork interface {
+	Execute(ctx context.Context, fn func(ctx context.Context) error) error
+}
+
 // MerchantRepository es el puerto que la capa de aplicación espera de
 // quien persista comercios
 type MerchantRepository interface {
@@ -45,9 +54,60 @@ type PaymentRepository interface {
 	GetByIdempotencyKey(ctx context.Context, idempotencyKey string) (*domain.Payment, error)
 	GetByMerchantAndExternalReference(ctx context.Context, merchantID, externalReference string) (*domain.Payment, error)
 	UpdateStatus(ctx context.Context, payment *domain.Payment) error
+	// MarkProcessing guarda providerReference, providerName (cuál
+	// proveedor externo procesa la operación — ver ProviderRegistry más
+	// abajo) y el paso a PROCESSING en una sola escritura, antes de
+	// contactar al proveedor externo (ver PaymentProvider más abajo).
+	MarkProcessing(ctx context.Context, paymentID, providerReference, providerName string, updatedAt time.Time) (*domain.Payment, error)
 	List(ctx context.Context, filter PaymentFilter) ([]*domain.Payment, error)
 	Count(ctx context.Context, filter PaymentFilter) (int64, error)
 	GetSummaryByMerchantID(ctx context.Context, merchantID string) (MerchantSummary, error)
+}
+
+// ProviderStatus es la respuesta de un PaymentProvider sobre una
+// operación de cobro — con tres valores posibles a propósito: además de
+// aprobado/rechazado, ProviderStatusProcessing cubre el caso legítimo de
+// que el proveedor mismo todavía no tenga una respuesta definitiva (no es
+// un error, es "vuelve a preguntar más tarde").
+type ProviderStatus string
+
+const (
+	ProviderStatusApproved   ProviderStatus = "APPROVED"
+	ProviderStatusRejected   ProviderStatus = "REJECTED"
+	ProviderStatusProcessing ProviderStatus = "PROCESSING"
+)
+
+// ChargeRequest agrupa lo que un PaymentProvider necesita para procesar
+// un cobro. ProviderReference la genera y persiste PaymentService ANTES
+// de llamar a Charge (ver PaymentRepository.MarkProcessing) — así, sin
+// importar si la respuesta de Charge se pierde, ya queda una referencia
+// estable para conciliar después con GetStatus.
+type ChargeRequest struct {
+	ProviderReference string
+	Amount            decimal.Decimal
+	Currency          string
+	PaymentMethod     domain.PaymentMethod
+}
+
+// PaymentProvider es el puerto hacia un proveedor externo de pagos (ej.
+// Nequi). Charge inicia el cobro; GetStatus consulta el estado real de
+// una operación ya iniciada, sin volver a cobrar nada — es el mecanismo
+// de conciliación para resolver pagos en UNKNOWN. Ambos métodos devuelven
+// ErrProviderUnreachable (ver errors.go) cuando no se obtuvo ninguna
+// respuesta del proveedor (timeout, caída de red), distinto de una
+// respuesta real de rechazo.
+type PaymentProvider interface {
+	Charge(ctx context.Context, req ChargeRequest) (ProviderStatus, error)
+	GetStatus(ctx context.Context, providerReference string) (ProviderStatus, error)
+}
+
+// ProviderRegistry resuelve, por nombre (ej. "nequi", "bre-b",
+// "simulated"), qué PaymentProvider concreto usar — así PaymentService
+// puede soportar más de un proveedor externo sin conocer ninguna
+// implementación concreta, ni tener que decidir con un if/switch cuál
+// usar. Devuelve ErrUnknownProvider si el nombre pedido no fue registrado.
+type ProviderRegistry interface {
+	Get(providerName string) (PaymentProvider, error)
 }
 
 // PaymentStatusHistoryRepository es el puerto para el historial de cambios

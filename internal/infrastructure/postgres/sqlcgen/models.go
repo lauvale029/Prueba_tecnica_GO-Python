@@ -32,6 +32,8 @@ type Payment struct {
 	IdempotencyKey    string
 	CreatedAt         time.Time
 	UpdatedAt         time.Time
+	ProviderReference sql.NullString
+	ProviderName      sql.NullString
 }
 
 type PaymentStatusHistory struct {
