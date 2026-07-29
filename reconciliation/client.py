@@ -34,10 +34,11 @@ class MovaAPIClient:
     def _auth_headers(self):
         return {"Authorization": f"Bearer {self._token}"}
 
-    def list_pending_payments(self):
-        """Devuelve todos los pagos en estado PENDING, recorriendo la
+    def list_payments_by_status(self, status):
+        """Devuelve todos los pagos en el estado dado, recorriendo la
         paginación de GET /payments hasta agotar el total reportado por
-        la API.
+        la API. Se usa tanto para PENDING (candidatos a rechazo) como para
+        PROCESSING/UNKNOWN (candidatos a conciliación).
         """
         payments = []
         page = 1
@@ -45,7 +46,7 @@ class MovaAPIClient:
         while True:
             response = self.session.get(
                 f"{self.base_url}/api/v1/payments",
-                params={"status": "PENDING", "page": page, "limit": PAGE_SIZE},
+                params={"status": status, "page": page, "limit": PAGE_SIZE},
                 headers=self._auth_headers(),
                 timeout=DEFAULT_TIMEOUT_SECONDS,
             )
@@ -67,6 +68,19 @@ class MovaAPIClient:
         response = self.session.patch(
             f"{self.base_url}/api/v1/payments/{payment_id}/status",
             json={"status": "REJECTED", "reason": reason},
+            headers=self._auth_headers(),
+            timeout=DEFAULT_TIMEOUT_SECONDS,
+        )
+        response.raise_for_status()
+        return response.json()
+
+    def reconcile_payment(self, payment_id):
+        """Llama POST /payments/{id}/reconcile: le pide a la API que le
+        pregunte al proveedor real qué pasó con un pago en PROCESSING o
+        UNKNOWN. Propaga requests.exceptions.RequestException si falla.
+        """
+        response = self.session.post(
+            f"{self.base_url}/api/v1/payments/{payment_id}/reconcile",
             headers=self._auth_headers(),
             timeout=DEFAULT_TIMEOUT_SECONDS,
         )

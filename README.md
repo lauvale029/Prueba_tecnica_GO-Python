@@ -257,7 +257,7 @@ Ver [`.env.example`](.env.example). Resumen:
 | `JWT_SECRET` | Secreto para firmar/validar tokens JWT (solo lo conoce el servidor, nunca se comparte) |
 | `JWT_EXPIRATION_MINUTES` | Duración del token emitido |
 | `AUTH_USERNAME`, `AUTH_PASSWORD` | Única credencial de servicio aceptada por `POST /api/v1/auth/login` (ver sección "Autenticación"); también las usa el worker de Python |
-| `API_BASE_URL`, `RECONCILIATION_THRESHOLD_MINUTES` | Solo para el worker de conciliación en Python (ver esa sección) |
+| `API_BASE_URL`, `RECONCILIATION_THRESHOLD_MINUTES`, `RECONCILIATION_INTERVAL_SECONDS` | Solo para el worker de conciliación en Python (ver esa sección) |
 
 ## Ejecución
 
@@ -265,8 +265,8 @@ Ver [`.env.example`](.env.example). Resumen:
 docker compose up --build
 ```
 
-Esto levanta la API, PostgreSQL y Redis. La API queda disponible en
-`http://localhost:8080`.
+Esto levanta la API, PostgreSQL, Redis, Swagger UI y el worker de
+conciliación en Python. La API queda disponible en `http://localhost:8080`.
 
 **Sin Docker** (con Postgres ya levantado y migrado, ver siguiente sección):
 
@@ -495,9 +495,11 @@ usando la misma credencial desde su propia configuración.
 
 Proceso independiente, en `reconciliation/`, que **nunca toca la base de
 datos directamente** — todo pasa por la API de Go, tal como exige el
-enunciado. Es una sola pasada (no un loop continuo): se ejecuta, hace su
-trabajo, imprime el resumen y termina; para correrlo periódicamente se
-agenda externamente (cron, Task Scheduler, o similar).
+enunciado. Corre en loop continuo (ver "Sección 2" para el porqué de este
+cambio frente al diseño original de una sola pasada): hace un barrido,
+imprime el resumen, duerme un intervalo configurable, y repite — pensado
+para correr como un servicio de larga duración (hay uno definido en
+`docker-compose.yml`), no para agendarse a mano cada vez.
 
 ### Instalación y ejecución
 
@@ -514,35 +516,61 @@ pip install -r requirements.txt
 python reconciliation_worker.py
 ```
 
+O, más simple, como el resto del stack:
+
+```bash
+docker compose up -d --build reconciliation-worker
+docker compose logs -f reconciliation-worker
+```
+
 Lee la configuración del `.env` de la raíz del repo (no tiene uno propio):
 reutiliza `AUTH_USERNAME`/`AUTH_PASSWORD` — la misma credencial de
-servicio que usa la API, ver "Autenticación" — más dos variables nuevas,
-`API_BASE_URL` (la URL de la API tal como la ve el worker, ej.
-`http://localhost:8080`) y `RECONCILIATION_THRESHOLD_MINUTES` (opcional,
-por defecto `30`).
+servicio que usa la API, ver "Autenticación" — más `API_BASE_URL` (la URL
+de la API tal como la ve el worker; dentro de Docker se sobrescribe a
+`http://api:8080`, el nombre del servicio en la red interna),
+`RECONCILIATION_THRESHOLD_MINUTES` (opcional, por defecto `30`) y
+`RECONCILIATION_INTERVAL_SECONDS` (opcional, por defecto `30`).
 
 ### Qué hace, paso a paso
 
-1. Login contra `POST /auth/login` (`client.py`).
-2. Lista **todos** los pagos `PENDING`, recorriendo la paginación de
-   `GET /payments` hasta agotar el `total` reportado (un comercio con más
-   de 100 pagos pendientes no se corta a la primera página).
-3. Filtra los que llevan más de `RECONCILIATION_THRESHOLD_MINUTES` desde
-   su `created_at` (`filter_stale_payments`, función pura, sin HTTP).
-4. Para cada uno, llama `PATCH /payments/{id}/status` con
-   `status=REJECTED`. Si esa llamada falla (red o respuesta no exitosa),
-   lo cuenta como fallido y **sigue con el resto** — un pago que no se
-   pudo reconciliar no debe frenar a los demás.
-5. Imprime el resumen exacto que pide el enunciado:
-   ```
-   Payments found: 5
-   Payments reconciled: 4
-   Payments failed: 1
-   ```
+Cada pasada hace **dos barridos**, porque son dos acciones con significado
+distinto (ver "Sección 2" para el detalle de por qué se separan):
 
-Un fallo al autenticarse o al listar pagos pendientes sí es fatal (sin
-eso no hay nada que hacer): imprime el error y termina con código de
-salida `1`.
+1. Login contra `POST /auth/login` (`client.py`), una sola vez al arrancar
+   — el token se reutiliza entre pasadas mientras siga vigente.
+2. **Pagos `PENDING` estancados:** lista todos (paginando `GET /payments`
+   hasta agotar el `total`), filtra los que llevan más de
+   `RECONCILIATION_THRESHOLD_MINUTES` desde su `created_at`
+   (`filter_stale_payments`, función pura, sin HTTP), y los **rechaza**
+   (`PATCH /payments/{id}/status`, `status=REJECTED`) — un `PENDING` tan
+   viejo nunca llegó a tocar al proveedor, así que no hay nada que
+   conciliar, solo cerrar algo que quedó a medias.
+3. **Pagos `PROCESSING`/`UNKNOWN` estancados:** mismo filtro de
+   antigüedad, pero en vez de asumir nada, se **concilia**
+   (`POST /payments/{id}/reconcile`) — le pregunta a la API que le
+   pregunte al proveedor real qué pasó. Según la respuesta, se cuenta como
+   resuelto (quedó `APPROVED`/`REJECTED`) o incierto todavía (el proveedor
+   tampoco lo sabe — no es una falla, se reintentará en la próxima
+   pasada).
+4. Si una llamada individual falla (red o respuesta no exitosa), se cuenta
+   como fallida y **se sigue con el resto** — un pago problemático no debe
+   frenar a los demás.
+5. Imprime el resumen de la pasada:
+   ```
+   Stale PENDING payments found: 4
+   Stale PENDING payments rejected: 3
+   Stale PENDING payments failed: 1
+   Stale PROCESSING/UNKNOWN payments found: 3
+   Stale PROCESSING/UNKNOWN payments resolved: 1
+   Stale PROCESSING/UNKNOWN payments still uncertain: 1
+   Stale PROCESSING/UNKNOWN payments failed: 1
+   ```
+6. Duerme `RECONCILIATION_INTERVAL_SECONDS` y repite desde el paso 2.
+
+Un fallo al autenticarse sí es fatal (sin login no hay nada que hacer):
+imprime el error y termina con código de salida `1`. Un fallo de red
+*durante* una pasada (ej. la API se cae a mitad de un barrido) se imprime
+y el loop sigue con la siguiente pasada, en vez de terminar el proceso.
 
 ### Pruebas
 
@@ -552,32 +580,38 @@ pip install -r requirements-dev.txt
 pytest -v
 ```
 
-21 tests con `pytest` + `requests-mock` (la API de Go nunca corre de
+27 tests con `pytest` + `requests-mock` (la API de Go nunca corre de
 verdad en estos tests):
 
-- `test_config.py` (7): lectura de variables requeridas, default del
-  umbral, error si falta alguna variable o si el umbral no es un entero.
-- `test_client.py` (7): login exitoso/credenciales inválidas/error de
-  red, paginación de `list_pending_payments` (una página y varias),
-  `reject_payment` exitoso y con error del servidor.
-- `test_reconciliation_worker.py` (5): la regla pura de "más de N
+- `test_config.py` (9): lectura de variables requeridas, defaults del
+  umbral y del intervalo, error si falta alguna variable requerida o si
+  el umbral/intervalo no son enteros.
+- `test_client.py` (8): login exitoso/credenciales inválidas/error de
+  red, paginación de `list_payments_by_status` (una página, varias, y que
+  envíe el status pedido), `reject_payment` y `reconcile_payment`
+  exitosos y con error del servidor.
+- `test_reconciliation_worker.py` (8): la regla pura de "más de N
   minutos" (incluye el caso límite exactamente en el umbral), y `run()`
-  con un cliente falso — reconciliación exitosa, un fallo que no detiene
-  a los demás, y el caso sin nada que reconciliar.
-- `test_main.py` (2): el flujo completo de `main()` con la API
-  completamente mockeada (login, listado paginado, un rechazo que falla
-  entre varios que sí funcionan) verificando el resumen impreso exacto, y
-  que un fallo de login termine el proceso con código `1`.
+  con un cliente falso — rechazo de `PENDING`, conciliación de
+  `PROCESSING`/`UNKNOWN` que sí resuelve, el caso donde el proveedor
+  responde sin error pero sigue sin saber la verdad (se cuenta aparte, no
+  como fallo), fallos que no detienen al resto, y el caso sin nada
+  pendiente.
+- `test_main.py` (2): el flujo completo de una pasada de `main()` con la
+  API completamente mockeada (login, ambos barridos, una falla en cada
+  uno, y un caso "sigue incierto") verificando el resumen impreso exacto,
+  y que un fallo de login termine el proceso con código `1`.
 
-Verificado también en vivo contra la API real en Docker: se creó un pago
-`PENDING`, se corrió el worker con `RECONCILIATION_THRESHOLD_MINUTES=0`
-(para no esperar 30 minutos de verdad) y se confirmó en
-`GET /payments/{id}/history` que quedó `REJECTED` con
-`changed_by: "mova-service"` — la misma credencial de servicio, porque el
-worker se autentica igual que cualquier otro consumidor de la API. También
-se probó con la API caída, confirmando que el mensaje de error de red es
-claro y el proceso termina con código `1` en vez de quedar colgado o
-fallar con un traceback críptico.
+Verificado también en vivo contra la API real en Docker, con el servicio
+`reconciliation-worker` corriendo de verdad junto a la API: en su primera
+pasada encontró 18 pagos reales que habían quedado en `PROCESSING`/
+`UNKNOWN` de sesiones de prueba anteriores y los procesó sin errores. Al
+investigar por qué algunos no terminaban resueltos se encontraron dos
+casos reales (ver "Sección 2" para el detalle): datos de prueba de antes
+de que existiera la columna `provider_name`, y el hecho de que el
+proveedor simulado guarda su memoria en RAM del proceso — se pierde al
+reconstruir el contenedor, indistinguible de un timeout real. Ambos se
+limpiaron de la base de desarrollo; ninguno era un bug del worker.
 
 ## Decisiones técnicas
 
@@ -722,14 +756,12 @@ fallar con un traceback críptico.
   nunca la fuente de verdad — si no está configurado o falla, el sistema
   sigue siendo correcto (`NoopIdempotencyLocker`/`NoopSummaryCache`),
   solo un poco más lento.
-- **Worker de Python — por qué una sola pasada y no un loop continuo:**
-  el enunciado lo ilustra como `python reconciliation_worker.py`, una
-  invocación puntual con un resumen impreso al final — no como un
-  servicio de larga duración. Una sola pasada es además más fácil de
-  probar de forma determinista (sin manejar señales ni temporizadores) y
-  más simple de operar: se agenda con las herramientas que ya existen
-  para eso (cron, Task Scheduler), en vez de reinventar un scheduler
-  propio dentro del script.
+- **Worker de Python — loop continuo con intervalo configurable:** corre
+  como un servicio de larga duración (`while True` + `time.sleep`,
+  contenerizado en `docker-compose.yml`) en vez de una sola pasada
+  agendada externamente — ver "Sección 2" para el detalle completo de
+  esta decisión y por qué se tomó después de extenderlo a
+  `PROCESSING`/`UNKNOWN`.
 - **El worker nunca toca Postgres directamente:** todo pasa por la API
   de Go (`client.py` solo hace peticiones HTTP) — cumple la restricción
   explícita del enunciado, y de paso mantiene una sola fuente de verdad
@@ -1103,3 +1135,111 @@ sequenceDiagram
     MOVA-->>A: 201 { id: "xyz", status: "APPROVED" }
     MOVA-->>B: 201 { id: "xyz", status: "APPROVED" } (mismo pago)
 ```
+
+### El worker de Python también concilia `PROCESSING`/`UNKNOWN`
+
+El worker original (ver sección "Worker de conciliación (Python)") solo
+sabía hacer una cosa: rechazar pagos `PENDING` estancados. Con los estados
+nuevos, eso se quedó corto — un pago puede quedar atascado en
+`PROCESSING`/`UNKNOWN` (justo los escenarios de riesgo de más arriba), y
+para esos rechazar sería incorrecto: no sabemos si el proveedor ya cobró
+de verdad. Lo correcto es **preguntarle** al proveedor, que es exactamente
+lo que hace `POST /payments/{id}/reconcile`.
+
+Por eso el worker ahora hace dos barridos por pasada, con acciones
+distintas a propósito:
+
+- `PENDING` estancado → **rechazar**. Un pago que nunca pasó de `PENDING`
+  nunca llegó a tocar al proveedor (la `provider_reference` se asigna
+  junto con el paso a `PROCESSING`, de forma atómica) — no hay nada que
+  conciliar, solo cerrar algo que quedó a medias antes de intentarse.
+- `PROCESSING`/`UNKNOWN` estancado → **conciliar**. Acá sí hubo un intento
+  real de cobro cuyo resultado no llegamos a confirmar; hay que
+  preguntarle al proveedor, no asumir nada.
+
+**Loop continuo en vez de una sola pasada.** El worker original corría una
+vez y terminaba (pensado para agendarse con cron/Task Scheduler). Al
+agregarle la conciliación de operaciones inciertas, tiene más sentido que
+sea un servicio de larga duración: un pago en `UNKNOWN` es, por
+definición, algo que el negocio quiere resolver lo antes posible, y
+depender de un cron externo agrega una capa de configuración que no
+aporta nada acá. El intervalo entre pasadas es una variable de entorno
+(`RECONCILIATION_INTERVAL_SECONDS`, 30s por defecto): revisar seguido no
+tiene un costo real a esta escala (el barrido son unas pocas peticiones
+HTTP), y da una recuperación más rápida de los pagos atascados. Como es
+configurable, no queda una decisión hardcodeada — quien lo despliegue
+puede ajustar el balance costo/latencia a su propio tráfico.
+
+**"Reconciliado" no es lo mismo que "resuelto".** `POST /reconcile`
+responde `200` tanto si de verdad resolvió el pago (`APPROVED`/
+`REJECTED`) como si el proveedor simplemente no sabe nada todavía (sigue
+en `PROCESSING`/`UNKNOWN`) — no es un error, es "vuelve a preguntar más
+tarde". La primera versión del worker contaba ambos casos como
+"reconciled", lo cual era engañoso: un pago que sigue exactamente igual
+no fue reconciliado, solo se le preguntó. El resumen ahora distingue tres
+cosas — `resolved` (cambió a un estado terminal), `still uncertain` (se
+preguntó, sigue igual, no es una falla) y `failed` (la petición en sí
+falló) — mirando el `status` que devuelve la respuesta de `/reconcile` en
+vez de asumir que "sin error" significa "resuelto".
+
+Esto se descubrió en la práctica: al correr el worker por primera vez
+contra la base de desarrollo, reportó 18 pagos "reconciliados" que en
+realidad seguían atascados. Investigar por qué reveló dos causas reales,
+ninguna un bug del worker en sí:
+
+1. **Datos de antes de que existiera `provider_name`** (columna agregada
+   en una migración posterior a `provider_reference`): sin `provider_name`,
+   `reconcileWithProvider` no sabe a qué proveedor preguntarle, y devuelve
+   el pago sin tocarlo — un no-op silencioso que antes se contaba como
+   éxito.
+2. **La memoria del proveedor simulado vive en RAM del proceso de la
+   API.** `SimulatedProvider` recuerda el resultado real de cada
+   `provider_reference` en un mapa en memoria (necesario para poder
+   simular el escenario de "aprobó pero la respuesta se perdió" — ver
+   `PaymentProvider` más arriba). Cada vez que se reconstruye el
+   contenedor de la API, esa memoria se pierde: una referencia cobrada por
+   un proceso anterior es, para el proceso nuevo, indistinguible de una
+   que el proveedor genuinamente nunca procesó. Es una limitación
+   esperable del *simulador* — un proveedor real (Nequi, Bre-B) recuerda
+   sus propias operaciones para siempre, de su lado — pero explica por
+   qué algunas conciliaciones en desarrollo no avanzan más allá de
+   `UNKNOWN` sin importar cuántas veces se reintenten.
+
+Ambos casos eran datos de prueba de sesiones anteriores, sin nada real que
+conservar, y se limpiaron de la base de desarrollo.
+
+### Go vs Python: qué vive dónde y por qué
+
+Más allá de que el enunciado pide explícitamente una API en Go más un
+componente en Python, hay una razón técnica real para dividir el trabajo
+así:
+
+- **El worker es un barrido periódico sin estado que compartir, no un
+  servicio con lógica de negocio propia.** Lista pagos, filtra por
+  antigüedad, llama uno o dos endpoints HTTP por pago, duerme, repite. No
+  hay concurrencia interna que coordinar ni un path caliente que
+  optimizar — es la forma clásica de un script/cron. Python con
+  `requests` y un loop resuelve esto en pocas líneas legibles; escribirlo
+  en Go no ganaría nada, porque ninguna de las fortalezas de Go
+  (concurrencia tipada, rendimiento) aplica acá.
+- **El desacople es estructural, no solo de disciplina.** El worker solo
+  puede hablar con la API por HTTP — no puede importar los paquetes
+  internos de Go ni tocar Postgres directamente, porque literalmente vive
+  en otro runtime. Si el worker fuera un paquete más dentro del mismo
+  módulo Go, sería tentador "atajar" e ir directo a la base de datos,
+  saltándose la máquina de estados, la atomicidad de `UnitOfWork` y el
+  registro en el historial que le dan sentido a todo lo construido en
+  esta sección. Al ser Python, esa puerta trasera ni siquiera existe como
+  opción.
+- **Ciclo de vida operativo independiente.** El worker puede reiniciarse
+  o desplegarse aparte de la API sin tocar su binario — tiene un perfil
+  de riesgo distinto: si se cae, nadie está esperando su respuesta
+  síncronamente, en el peor caso un pago tarda un poco más en
+  conciliarse.
+
+La API de Go, en cambio, concentra todo lo que sí necesita ser
+transaccional y ser una única fuente de verdad: la máquina de estados de
+`Payment`, la atomicidad estado+historial (`UnitOfWork`), la idempotencia,
+y la comunicación con el proveedor externo. Ninguna de esas
+responsabilidades se delega al worker — el worker las *consume*, nunca
+las reimplementa.
