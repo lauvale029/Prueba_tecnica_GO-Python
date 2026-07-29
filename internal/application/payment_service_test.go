@@ -293,21 +293,35 @@ const (
 	fakeProviderApprove fakeProviderBehavior = iota
 	fakeProviderReject
 	fakeProviderUnreachable
+	// fakeProviderApprovedButLost reproduce el escenario de riesgo
+	// central: el proveedor SÍ aprueba de verdad (GetStatus lo revela),
+	// pero Charge le devuelve a MOVA ErrProviderUnreachable, como si la
+	// respuesta se hubiera perdido en el camino.
+	fakeProviderApprovedButLost
 )
 
 // fakeProvider es un puntero a propósito: algunos tests cambian
 // provider.behavior a mitad de camino (para simular "el proveedor ya
 // sabe qué pasó" en un reintento) — con un value type, esa mutación no
 // se vería reflejada en la copia que el registry ya tiene guardada.
+// chargeCallCount cuenta cuántas veces se llamó Charge de verdad, para
+// poder probar en los escenarios narrados que un reintento nunca vuelve
+// a cobrar.
 type fakeProvider struct {
-	behavior fakeProviderBehavior
+	mu              sync.Mutex
+	behavior        fakeProviderBehavior
+	chargeCallCount int
 }
 
 func (p *fakeProvider) Charge(_ context.Context, _ application.ChargeRequest) (application.ProviderStatus, error) {
+	p.mu.Lock()
+	p.chargeCallCount++
+	p.mu.Unlock()
+
 	switch p.behavior {
 	case fakeProviderReject:
 		return application.ProviderStatusRejected, nil
-	case fakeProviderUnreachable:
+	case fakeProviderUnreachable, fakeProviderApprovedButLost:
 		return "", application.ErrProviderUnreachable
 	default:
 		return application.ProviderStatusApproved, nil
@@ -320,9 +334,16 @@ func (p *fakeProvider) GetStatus(_ context.Context, _ string) (application.Provi
 		return application.ProviderStatusRejected, nil
 	case fakeProviderUnreachable:
 		return application.ProviderStatusProcessing, nil
-	default:
+	default: // fakeProviderApprove y fakeProviderApprovedButLost: el
+		// proveedor sí sabe que aprobó, aunque Charge haya fallado.
 		return application.ProviderStatusApproved, nil
 	}
+}
+
+func (p *fakeProvider) chargeCalls() int {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.chargeCallCount
 }
 
 // fakeProviderRegistry siempre devuelve el mismo proveedor, sin importar

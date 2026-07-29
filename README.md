@@ -356,16 +356,17 @@ pruebas de atomicidad de `UnitOfWork` (revierte todo ante un fallo a
 mitad de camino, confirma todo junto en el camino feliz — ver
 "Sección 2"). 20 tests en total.
 
-`internal/application` (24 tests) prueba `MerchantService` y
+`internal/application` (29 tests) prueba `MerchantService` y
 `PaymentService` con repositorios falsos en memoria: que el dominio
 valide antes de persistir, que los errores se propaguen o se resuelvan
 según corresponda, transición de estado válida/inválida con su registro
 en el historial, que el resumen se calcule bien y use/invalide la cache
 correctamente, que 20 goroutines concurrentes con la misma
 `Idempotency-Key` converjan en un solo pago (ver "Idempotencia y
-concurrencia" más abajo), y el flujo con el proveedor de pagos: cobro
+concurrencia" más abajo), el flujo con el proveedor de pagos (cobro
 aprobado/rechazado, proveedor inalcanzable → `UNKNOWN`, y que un
-reintento con la misma key concilie en vez de volver a cobrar — ver
+reintento con la misma key concilie en vez de volver a cobrar), y los 5
+escenarios de riesgo narrados con `t.Logf` — ver
 "Sección 2".
 
 `internal/infrastructure/auth` (4 tests) prueba la emisión y validación
@@ -1010,3 +1011,95 @@ resuelve a `APPROVED` en la misma respuesta de `POST /payments`, con el
 historial mostrando `PENDING→PROCESSING→APPROVED`, `changed_by` con el
 subject del JWT autenticado, y `provider_reference`/`provider_name`
 guardados en Postgres.
+
+### Los 5 escenarios de riesgo, probados y narrados
+
+`internal/application/payment_provider_scenarios_test.go` tiene 5 tests
+dedicados, cada uno con `t.Logf` narrando paso a paso lo que pasa — se
+corren así, con `-v` para ver la narración:
+
+```bash
+go test ./internal/application/... -run TestScenario -v
+```
+
+1. **`TestScenario1_NormalApproval`** — respuesta aprobada normal.
+2. **`TestScenario2_TimeoutBeforeKnowingResult`** — el proveedor no
+   responde, y conciliar de inmediato tampoco revela nada (a diferencia
+   del escenario 4, acá el proveedor genuinamente no sabe todavía).
+3. **`TestScenario3_RetrySameIdempotencyKey`** — reintento con la misma
+   key; se verifica contando las llamadas reales a `provider.Charge`
+   (debe quedar en `1`, nunca en `2`).
+4. **`TestScenario4_ApprovedButResponseLost`** — el escenario de riesgo
+   central del documento base: el proveedor aprueba de verdad, la
+   respuesta se pierde, y la conciliación revela la verdad.
+5. **`TestScenario5_ConcurrentRequests`** — 2 peticiones concurrentes con
+   la misma key; una sola fila, un solo cobro real al proveedor.
+
+### Diagrama de estados con el proveedor conectado
+
+```mermaid
+stateDiagram-v2
+    [*] --> PENDING
+    PENDING --> PROCESSING: se envía al proveedor
+    PENDING --> APPROVED: PATCH manual
+    PENDING --> REJECTED: PATCH manual
+    PENDING --> CANCELLED: PATCH manual
+    PROCESSING --> APPROVED: el proveedor aprueba
+    PROCESSING --> REJECTED: el proveedor rechaza
+    PROCESSING --> UNKNOWN: el proveedor no responde
+    UNKNOWN --> APPROVED: la conciliación revela aprobación
+    UNKNOWN --> REJECTED: la conciliación revela rechazo
+    APPROVED --> [*]
+    REJECTED --> [*]
+    CANCELLED --> [*]
+```
+
+### Diagrama de secuencia — Escenario 4 (el riesgo central)
+
+```mermaid
+sequenceDiagram
+    participant Cliente
+    participant MOVA
+    participant Proveedor
+
+    Cliente->>MOVA: POST /payments (Idempotency-Key: abc-123)
+    MOVA->>MOVA: Guarda PENDING, genera provider_reference
+    MOVA->>MOVA: Marca PROCESSING (atómico con su historial)
+    MOVA->>Proveedor: Charge(provider_reference, monto)
+    Proveedor->>Proveedor: Aprueba internamente
+    Proveedor--xMOVA: la respuesta se pierde en el camino
+    MOVA->>MOVA: Charge devolvió error -> marca UNKNOWN
+    MOVA-->>Cliente: 201 { status: "UNKNOWN" }
+
+    Note over Cliente,Proveedor: Más tarde — se dispara la conciliación
+
+    Cliente->>MOVA: POST /payments/{id}/reconcile
+    MOVA->>Proveedor: GetStatus(provider_reference)
+    Proveedor-->>MOVA: APPROVED (la verdad, revelada)
+    MOVA->>MOVA: Marca APPROVED (atómico con su historial)
+    MOVA-->>Cliente: 200 { status: "APPROVED" }
+```
+
+### Diagrama de secuencia — Escenario 5 (concurrencia)
+
+```mermaid
+sequenceDiagram
+    participant A as Petición A
+    participant B as Petición B
+    participant MOVA
+    participant Proveedor
+
+    par Llegan al mismo tiempo
+        A->>MOVA: POST /payments (misma Idempotency-Key)
+    and
+        B->>MOVA: POST /payments (misma Idempotency-Key)
+    end
+
+    Note over MOVA: UNIQUE(idempotency_key) en Postgres decide: solo UNA gana
+
+    MOVA->>Proveedor: Charge(...) — solo la ganadora llama
+    Proveedor-->>MOVA: APPROVED
+
+    MOVA-->>A: 201 { id: "xyz", status: "APPROVED" }
+    MOVA-->>B: 201 { id: "xyz", status: "APPROVED" } (mismo pago)
+```
