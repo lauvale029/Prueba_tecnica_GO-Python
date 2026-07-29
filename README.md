@@ -356,14 +356,17 @@ pruebas de atomicidad de `UnitOfWork` (revierte todo ante un fallo a
 mitad de camino, confirma todo junto en el camino feliz — ver
 "Sección 2"). 20 tests en total.
 
-`internal/application` (21 tests) prueba `MerchantService` y
+`internal/application` (24 tests) prueba `MerchantService` y
 `PaymentService` con repositorios falsos en memoria: que el dominio
 valide antes de persistir, que los errores se propaguen o se resuelvan
 según corresponda, transición de estado válida/inválida con su registro
 en el historial, que el resumen se calcule bien y use/invalide la cache
-correctamente, y (el más importante) que 20 goroutines concurrentes con
-la misma `Idempotency-Key` converjan en un solo pago — ver la sección
-"Idempotencia y concurrencia" más abajo.
+correctamente, que 20 goroutines concurrentes con la misma
+`Idempotency-Key` converjan en un solo pago (ver "Idempotencia y
+concurrencia" más abajo), y el flujo con el proveedor de pagos: cobro
+aprobado/rechazado, proveedor inalcanzable → `UNKNOWN`, y que un
+reintento con la misma key concilie en vez de volver a cobrar — ver
+"Sección 2".
 
 `internal/infrastructure/auth` (4 tests) prueba la emisión y validación
 de JWT en aislamiento: ida y vuelta con un secreto correcto, rechazo con
@@ -377,15 +380,16 @@ coexistan sin pisarse) — ver "Sección 2".
 `internal/middleware` (5 tests) prueba `RequireAuth` como middleware
 Fiber genérico (sin el router real de por medio): sin header, header sin
 `Bearer`, token inválido, token expirado, token válido.
-`internal/transport/http` (32 tests) prueba **todos** los endpoints de
-comercios y pagos (`POST`/`GET`/`PATCH .../status`/`GET .../history`/
-`GET .../summary`) completos con `app.Test(...)` de Fiber (request/response
-JSON reales, sin red), cubriendo los distintos códigos HTTP posibles
-(`201`, `200`, `404`, `409`, `422`, `400`, `401`) — incluye login válido/
-credenciales incorrectas, y que las rutas reales del router (no el
-middleware aislado) devuelvan `401` sin token/con token inválido/expirado,
-y que `/auth/login` sea la única ruta pública. Ninguno de estos paquetes
-necesita Postgres.
+`internal/transport/http` (35 tests) prueba **todos** los endpoints de
+comercios y pagos (`POST`/`GET`/`PATCH .../status`/`POST .../reconcile`/
+`GET .../history`/`GET .../summary`) completos con `app.Test(...)` de
+Fiber (request/response JSON reales, sin red), cubriendo los distintos
+códigos HTTP posibles (`201`, `200`, `404`, `409`, `422`, `400`, `401`)
+— incluye login válido/credenciales incorrectas, que las rutas reales
+del router (no el middleware aislado) devuelvan `401` sin token/con
+token inválido/expirado, que `/auth/login` sea la única ruta pública, y
+que `/reconcile` resuelva un pago en `UNKNOWN` sin tocar uno ya
+resuelto. Ninguno de estos paquetes necesita Postgres.
 
 El worker de conciliación en Python (`reconciliation/`) tiene su propia
 suite, independiente de `go test` — ver la sección "Worker de
@@ -973,3 +977,36 @@ Verificado con dos pruebas de integración contra Postgres real
 error justo después de la primera escritura y confirma que **ambas**
 quedan revertidas (no solo la que falló), y otra confirma que el camino
 feliz persiste las dos juntas.
+
+### El flujo de creación completo, con el proveedor conectado
+
+`PaymentService.Create` (`internal/application/payment_service.go`) ya
+no solo persiste el pago en `PENDING` — lo envía de verdad al proveedor
+configurado y resuelve el resultado antes de responder:
+
+1. **Replay** por `Idempotency-Key`: si el pago ya existe y quedó en
+   `PROCESSING`/`UNKNOWN` de un intento anterior, se concilia ahí mismo
+   (ver más abajo) antes de devolverlo — **nunca se vuelve a llamar al
+   proveedor** para una key repetida.
+2. El comercio debe existir; lock opcional en Redis (igual que siempre).
+3. Se valida con el dominio y se persiste en `PENDING`.
+4. **`PENDING → PROCESSING`**: se genera un `provider_reference` nuevo y
+   se guarda de forma atómica con su entrada de historial — antes de
+   llamar al proveedor.
+5. Se llama a `provider.Charge(...)`. Si responde claro, se resuelve a
+   `APPROVED`/`REJECTED`. Si devuelve `ErrProviderUnreachable`, se marca
+   `UNKNOWN`.
+
+Un método público, `PaymentService.Reconcile(ctx, paymentID, changedBy)`,
+le pregunta al proveedor el estado real de un pago en
+`PROCESSING`/`UNKNOWN` — es el mismo mecanismo que usa el paso 1 del
+replay, expuesto también como `POST /api/v1/payments/{id}/reconcile`
+para que algo externo (ej. el worker de Python, ver más abajo) lo
+dispare sobre pagos atascados por demasiado tiempo. Si el pago ya está
+resuelto, es un no-op — nunca cambia nada ni falla.
+
+Verificado en vivo contra la API real en Docker: un pago creado se
+resuelve a `APPROVED` en la misma respuesta de `POST /payments`, con el
+historial mostrando `PENDING→PROCESSING→APPROVED`, `changed_by` con el
+subject del JWT autenticado, y `provider_reference`/`provider_name`
+guardados en Postgres.
