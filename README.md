@@ -816,6 +816,19 @@ decidir, asumimos:
   servicio (`postgres:5432`, `redis:6379`) — la única forma de que
   `docker compose up --build` funcione de punta a punta sin pasos
   manuales adicionales.
+- **No se integró un simulador open source de Nequi/Bre-B:** se construyó un simulador propio
+  (`SimulatedProvider`, ver "Sección 2") en vez de integrar uno de
+  terceros, para poder reproducir de forma determinista y sin
+  dependencias externas los escenarios de riesgo exigidos (aprobación,
+  timeout, aprobado-pero-perdido). La abstracción `PaymentProvider` queda
+  lista para conectar un proveedor real (o uno de terceros) sin tocar
+  `PaymentService`.
+- **La memoria del proveedor simulado vive en RAM del proceso de la API:**
+  se pierde al reconstruir el contenedor, lo cual es indistinguible de un
+  timeout real del proveedor. No es una limitación de la arquitectura
+  real (un proveedor de verdad recuerda sus propias operaciones para
+  siempre), solo del simulador — ver "Sección 2" para el detalle
+  encontrado en pruebas en vivo.
 
 ## Sección 2
 
