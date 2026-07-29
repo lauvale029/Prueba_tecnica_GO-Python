@@ -5,6 +5,7 @@ import (
 	"errors"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/shopspring/decimal"
 
 	"github.com/lauvale029/Prueba_tecnica_GO-Python/internal/domain"
@@ -24,26 +25,56 @@ const (
 	MaxLimit     = 100
 )
 
+// Razones fijas para las entradas de historial que genera el propio
+// sistema (no un cambio manual vía PATCH /status).
+const (
+	reasonSentToProvider   = "enviado al proveedor de pagos"
+	reasonProviderNoAnswer = "el proveedor no respondió"
+	reasonReconciled       = "conciliado con el proveedor"
+)
+
 // PaymentService orquesta el caso de uso de pagos: valida con el
-// dominio, verifica que el comercio exista, y aplica la estrategia de
-// idempotencia/concurrencia (ver README, sección "Idempotencia y
-// concurrencia").
+// dominio, verifica que el comercio exista, aplica la estrategia de
+// idempotencia/concurrencia, y — desde Sección 2 — envía el cobro a un
+// proveedor de pagos externo y concilia operaciones inciertas.
 type PaymentService struct {
-	payments  PaymentRepository
-	merchants MerchantRepository
-	history   PaymentStatusHistoryRepository
-	locker    IdempotencyLocker
-	summaries SummaryCache
-	uow       UnitOfWork
+	payments            PaymentRepository
+	merchants           MerchantRepository
+	history             PaymentStatusHistoryRepository
+	locker              IdempotencyLocker
+	summaries           SummaryCache
+	uow                 UnitOfWork
+	providers           ProviderRegistry
+	defaultProviderName string
 }
 
-func NewPaymentService(payments PaymentRepository, merchants MerchantRepository, history PaymentStatusHistoryRepository, locker IdempotencyLocker, summaries SummaryCache, uow UnitOfWork) *PaymentService {
-	return &PaymentService{payments: payments, merchants: merchants, history: history, locker: locker, summaries: summaries, uow: uow}
+func NewPaymentService(
+	payments PaymentRepository,
+	merchants MerchantRepository,
+	history PaymentStatusHistoryRepository,
+	locker IdempotencyLocker,
+	summaries SummaryCache,
+	uow UnitOfWork,
+	providers ProviderRegistry,
+	defaultProviderName string,
+) *PaymentService {
+	return &PaymentService{
+		payments:            payments,
+		merchants:           merchants,
+		history:             history,
+		locker:              locker,
+		summaries:           summaries,
+		uow:                 uow,
+		providers:           providers,
+		defaultProviderName: defaultProviderName,
+	}
 }
 
-// Create crea un pago nuevo, o devuelve el pago ya existente si
-// idempotencyKey ya fue usada antes (idempotencia) o si otra petición
-// concurrente con la misma key ganó la carrera (concurrencia).
+// Create crea un pago nuevo y lo envía al proveedor de pagos configurado,
+// o resuelve el pago ya existente si idempotencyKey ya fue usada antes
+// (idempotencia) o si otra petición concurrente con la misma key ganó la
+// carrera (concurrencia). changedBy identifica quién origina la
+// operación (el subject del JWT autenticado), para el historial.
 func (s *PaymentService) Create(
 	ctx context.Context,
 	merchantID, externalReference string,
@@ -51,14 +82,17 @@ func (s *PaymentService) Create(
 	currency string,
 	method domain.PaymentMethod,
 	idempotencyKey string,
+	changedBy string,
 ) (*domain.Payment, error) {
 	if idempotencyKey == "" {
 		return nil, domain.ErrMissingIdempotencyKey
 	}
 
-	// 1. Replay: si esta key ya se usó, devolvemos el pago original.
+	// 1. Replay: si esta key ya se usó, resolvemos su estado incierto (si
+	// aplica — ver resolveIfUncertain) y devolvemos el pago. Un reintento
+	// NUNCA vuelve a llamar al proveedor directamente.
 	if existing, err := s.payments.GetByIdempotencyKey(ctx, idempotencyKey); err == nil {
-		return existing, nil
+		return s.resolveIfUncertain(ctx, existing, changedBy)
 	} else if !errors.Is(err, ErrNotFound) {
 		return nil, err
 	}
@@ -78,13 +112,13 @@ func (s *PaymentService) Create(
 	if !acquired {
 		time.Sleep(idempotencyRetryDelay)
 		if existing, err := s.payments.GetByIdempotencyKey(ctx, idempotencyKey); err == nil {
-			return existing, nil
+			return s.resolveIfUncertain(ctx, existing, changedBy)
 		} else if !errors.Is(err, ErrNotFound) {
 			return nil, err
 		}
 	}
 
-	// 4. Validar con el dominio y persistir.
+	// 4. Validar con el dominio y persistir en PENDING.
 	payment, err := domain.NewPayment(merchantID, externalReference, amount, currency, method, idempotencyKey)
 	if err != nil {
 		return nil, err
@@ -96,10 +130,10 @@ func (s *PaymentService) Create(
 		}
 
 		// 5. Postgres rechazó por una restricción única. Si es la misma
-		// idempotencyKey, alguien más ganó la carrera: devolvemos su
-		// pago (esto SÍ es un replay exitoso). Si no aparece nada con
-		// esta key, el conflicto fue por external_reference duplicada:
-		// un error real, no un replay.
+		// idempotencyKey, alguien más ganó la carrera: resolvemos SU pago
+		// (esto sí es un replay exitoso). Si no aparece nada con esta
+		// key, el conflicto fue por external_reference duplicada: un
+		// error real, no un replay.
 		existing, getErr := s.payments.GetByIdempotencyKey(ctx, idempotencyKey)
 		if getErr != nil {
 			if errors.Is(getErr, ErrNotFound) {
@@ -107,10 +141,126 @@ func (s *PaymentService) Create(
 			}
 			return nil, getErr
 		}
-		return existing, nil
+		return s.resolveIfUncertain(ctx, existing, changedBy)
 	}
 
-	return payment, nil
+	// 6. Pago nuevo, sin ningún intento previo: enviarlo al proveedor.
+	return s.chargeWithProvider(ctx, payment, changedBy)
+}
+
+// resolveIfUncertain concilia con el proveedor si existing quedó en un
+// estado incierto de un intento anterior (PROCESSING/UNKNOWN). Si ya
+// está resuelto (APPROVED/REJECTED/CANCELLED) o ni siquiera se envió al
+// proveedor todavía (PENDING), se devuelve tal cual, sin tocar nada.
+func (s *PaymentService) resolveIfUncertain(ctx context.Context, existing *domain.Payment, changedBy string) (*domain.Payment, error) {
+	if existing.Status != domain.PaymentStatusProcessing && existing.Status != domain.PaymentStatusUnknown {
+		return existing, nil
+	}
+	return s.reconcileWithProvider(ctx, existing, changedBy)
+}
+
+// chargeWithProvider marca payment como PROCESSING (guardando una
+// referencia de operación nueva ANTES de llamar al proveedor, de forma
+// atómica con su entrada de historial — ver README, Sección 2), lo envía
+// al proveedor configurado, y resuelve el resultado.
+func (s *PaymentService) chargeWithProvider(ctx context.Context, payment *domain.Payment, changedBy string) (*domain.Payment, error) {
+	providerReference := uuid.New().String()
+	previousStatus := payment.Status
+
+	err := s.uow.Execute(ctx, func(txCtx context.Context) error {
+		updated, err := s.payments.MarkProcessing(txCtx, payment.ID, providerReference, s.defaultProviderName, time.Now().UTC())
+		if err != nil {
+			return err
+		}
+		*payment = *updated
+
+		history := domain.NewPaymentStatusHistory(payment.ID, previousStatus, payment.Status, reasonSentToProvider, changedBy)
+		return s.history.Create(txCtx, history)
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	provider, err := s.providers.Get(s.defaultProviderName)
+	if err != nil {
+		return nil, err
+	}
+
+	status, chargeErr := provider.Charge(ctx, ChargeRequest{
+		ProviderReference: providerReference,
+		Amount:            payment.Amount.Amount,
+		Currency:          payment.Amount.Currency,
+		PaymentMethod:     payment.PaymentMethod,
+	})
+	if chargeErr != nil {
+		if !errors.Is(chargeErr, ErrProviderUnreachable) {
+			return nil, chargeErr
+		}
+		return s.applyStatusChange(ctx, payment, domain.PaymentStatusUnknown, reasonProviderNoAnswer, changedBy)
+	}
+
+	return s.applyStatusChange(ctx, payment, providerStatusToDomain(status), reasonSentToProvider, changedBy)
+}
+
+// Reconcile consulta al proveedor el estado real de un pago en
+// PROCESSING/UNKNOWN y lo resuelve si hay una respuesta clara — pensado
+// para dispararse desde fuera (ej. el worker de Python) sobre pagos
+// atascados por demasiado tiempo. Si el pago ya está resuelto, lo
+// devuelve tal cual, sin error.
+func (s *PaymentService) Reconcile(ctx context.Context, paymentID, changedBy string) (*domain.Payment, error) {
+	payment, err := s.payments.GetByID(ctx, paymentID)
+	if err != nil {
+		return nil, err
+	}
+	return s.resolveIfUncertain(ctx, payment, changedBy)
+}
+
+// reconcileWithProvider asume que payment está en PROCESSING o UNKNOWN
+// (con ProviderReference/ProviderName ya asignados) y le pregunta al
+// proveedor qué pasó de verdad.
+func (s *PaymentService) reconcileWithProvider(ctx context.Context, payment *domain.Payment, changedBy string) (*domain.Payment, error) {
+	if payment.ProviderReference == nil || payment.ProviderName == nil {
+		return payment, nil // nunca se llegó a enviar a un proveedor
+	}
+
+	provider, err := s.providers.Get(*payment.ProviderName)
+	if err != nil {
+		return nil, err
+	}
+
+	status, err := provider.GetStatus(ctx, *payment.ProviderReference)
+	if err != nil {
+		if !errors.Is(err, ErrProviderUnreachable) {
+			return nil, err
+		}
+		return s.markUnknownIfProcessing(ctx, payment, changedBy)
+	}
+
+	switch status {
+	case ProviderStatusApproved:
+		return s.applyStatusChange(ctx, payment, domain.PaymentStatusApproved, reasonReconciled, changedBy)
+	case ProviderStatusRejected:
+		return s.applyStatusChange(ctx, payment, domain.PaymentStatusRejected, reasonReconciled, changedBy)
+	default: // ProviderStatusProcessing: el proveedor tampoco lo sabe todavía
+		return s.markUnknownIfProcessing(ctx, payment, changedBy)
+	}
+}
+
+// markUnknownIfProcessing mueve PROCESSING->UNKNOWN la primera vez que no
+// hay respuesta clara; si payment ya estaba en UNKNOWN, no hay nada que
+// transicionar (UNKNOWN->UNKNOWN no es una transición real).
+func (s *PaymentService) markUnknownIfProcessing(ctx context.Context, payment *domain.Payment, changedBy string) (*domain.Payment, error) {
+	if payment.Status != domain.PaymentStatusProcessing {
+		return payment, nil
+	}
+	return s.applyStatusChange(ctx, payment, domain.PaymentStatusUnknown, reasonProviderNoAnswer, changedBy)
+}
+
+func providerStatusToDomain(status ProviderStatus) domain.PaymentStatus {
+	if status == ProviderStatusRejected {
+		return domain.PaymentStatusRejected
+	}
+	return domain.PaymentStatusApproved
 }
 
 // Get consulta un pago existente por su ID.
@@ -147,15 +297,12 @@ func (s *PaymentService) List(ctx context.Context, filter PaymentFilter) ([]*dom
 	return payments, total, nil
 }
 
-// UpdateStatus aplica una transición de estado (domain.Payment.ChangeStatus
-// decide si es válida) y deja el registro correspondiente en el
-// historial.
-func (s *PaymentService) UpdateStatus(ctx context.Context, paymentID string, newStatus domain.PaymentStatus, reason, changedBy string) (*domain.Payment, error) {
-	payment, err := s.payments.GetByID(ctx, paymentID)
-	if err != nil {
-		return nil, err
-	}
-
+// applyStatusChange aplica una transición de estado (domain.Payment.ChangeStatus
+// decide si es válida), deja el registro correspondiente en el historial
+// de forma atómica, e invalida la cache del resumen del comercio.
+// Compartido por UpdateStatus (cambio manual) y por los cambios
+// automáticos que dispara el proveedor de pagos (Create, Reconcile).
+func (s *PaymentService) applyStatusChange(ctx context.Context, payment *domain.Payment, newStatus domain.PaymentStatus, reason, changedBy string) (*domain.Payment, error) {
 	previousStatus := payment.Status
 	if err := payment.ChangeStatus(newStatus); err != nil {
 		return nil, err
@@ -166,7 +313,7 @@ func (s *PaymentService) UpdateStatus(ctx context.Context, paymentID string, new
 	// una escritura y la otra, quedaría un pago con un estado que nadie
 	// puede explicar (sin una entrada de historial que lo justifique).
 	history := domain.NewPaymentStatusHistory(payment.ID, previousStatus, payment.Status, reason, changedBy)
-	err = s.uow.Execute(ctx, func(txCtx context.Context) error {
+	err := s.uow.Execute(ctx, func(txCtx context.Context) error {
 		if err := s.payments.UpdateStatus(txCtx, payment); err != nil {
 			return err
 		}
@@ -182,6 +329,16 @@ func (s *PaymentService) UpdateStatus(ctx context.Context, paymentID string, new
 	s.summaries.Invalidate(ctx, payment.MerchantID)
 
 	return payment, nil
+}
+
+// UpdateStatus aplica una transición de estado manual (ej. vía
+// PATCH /payments/{id}/status), sin pasar por ningún proveedor externo.
+func (s *PaymentService) UpdateStatus(ctx context.Context, paymentID string, newStatus domain.PaymentStatus, reason, changedBy string) (*domain.Payment, error) {
+	payment, err := s.payments.GetByID(ctx, paymentID)
+	if err != nil {
+		return nil, err
+	}
+	return s.applyStatusChange(ctx, payment, newStatus, reason, changedBy)
 }
 
 // History devuelve el historial de cambios de estado de un pago,

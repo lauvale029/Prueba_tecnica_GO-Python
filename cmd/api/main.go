@@ -6,9 +6,16 @@ import (
 	"github.com/lauvale029/Prueba_tecnica_GO-Python/internal/application"
 	"github.com/lauvale029/Prueba_tecnica_GO-Python/internal/infrastructure/config"
 	"github.com/lauvale029/Prueba_tecnica_GO-Python/internal/infrastructure/postgres"
+	providerinfra "github.com/lauvale029/Prueba_tecnica_GO-Python/internal/infrastructure/provider"
 	redisinfra "github.com/lauvale029/Prueba_tecnica_GO-Python/internal/infrastructure/redis"
 	transporthttp "github.com/lauvale029/Prueba_tecnica_GO-Python/internal/transport/http"
 )
+
+// defaultProviderName es el único proveedor real configurado hoy — un
+// simulador que aprueba de inmediato. Cuando exista un segundo proveedor
+// real (ver README, Sección 2), esto pasa a ser una elección por pago,
+// no una constante fija.
+const defaultProviderName = "simulated"
 
 func main() {
 	cfg, err := config.Load()
@@ -37,7 +44,11 @@ func main() {
 	paymentRepo := postgres.NewPaymentRepository(db)
 	paymentHistoryRepo := postgres.NewPaymentStatusHistoryRepository(db)
 	uow := postgres.NewUnitOfWork(db)
-	paymentService := application.NewPaymentService(paymentRepo, merchantRepo, paymentHistoryRepo, locker, summaryCache, uow)
+
+	providerRegistry := providerinfra.NewRegistry().
+		Register(defaultProviderName, providerinfra.NewSimulatedProvider(providerinfra.BehaviorApprove))
+
+	paymentService := application.NewPaymentService(paymentRepo, merchantRepo, paymentHistoryRepo, locker, summaryCache, uow, providerRegistry, defaultProviderName)
 	paymentHandler := transporthttp.NewPaymentHandler(paymentService)
 
 	merchantService := application.NewMerchantService(merchantRepo)
