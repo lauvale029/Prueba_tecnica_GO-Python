@@ -132,8 +132,11 @@ func TestGetMerchantSummary_Success(t *testing.T) {
 	require.NoError(t, json.NewDecoder(resp.Body).Decode(&got))
 	require.Equal(t, merchant.ID, got["merchant_id"])
 	require.EqualValues(t, 1, got["total_payments"])
-	require.EqualValues(t, 0, got["approved_payments"])
-	require.EqualValues(t, 1, got["pending_payments"])
+	// El proveedor falso de este paquete aprueba de inmediato (ver
+	// fakeProvider en helpers_test.go): el pago creado ya no queda en
+	// PENDING, se resuelve a APPROVED antes de que Create responda.
+	require.EqualValues(t, 1, got["approved_payments"])
+	require.EqualValues(t, 0, got["pending_payments"])
 }
 
 func TestGetMerchantSummary_NotFound(t *testing.T) {

@@ -56,7 +56,10 @@ func TestCreatePayment_Success(t *testing.T) {
 	require.Equal(t, merchant.ID, got["merchant_id"])
 	require.Equal(t, "ORDER-1001", got["external_reference"])
 	require.Equal(t, json.Number("150000"), got["amount"])
-	require.Equal(t, "PENDING", got["status"])
+	// El proveedor falso de este paquete aprueba de inmediato (ver
+	// fakeProvider en helpers_test.go): Create ya no deja el pago en
+	// PENDING, lo resuelve contra el proveedor antes de responder.
+	require.Equal(t, "APPROVED", got["status"])
 	require.NotEmpty(t, got["id"])
 }
 
@@ -274,8 +277,12 @@ func TestListPayments_InvalidStatusFilter(t *testing.T) {
 	require.Equal(t, http.StatusBadRequest, resp.StatusCode)
 }
 
+// TestUpdatePaymentStatus_Success usa un proveedor inalcanzable a
+// propósito: así el pago queda en UNKNOWN tras crearse (en vez de
+// resolverse solo), dejando algo pendiente de aprobar manualmente que
+// probar — PATCH /status sigue permitiendo resolver UNKNOWN a mano.
 func TestUpdatePaymentStatus_Success(t *testing.T) {
-	ta := setupApp()
+	ta := setupAppWithProviderBehavior(fakeProviderUnreachable)
 	merchant := createTestMerchantInApp(t, ta)
 	created := createTestPayment(t, ta, merchant.ID, "ORDER-STATUS-1")
 
@@ -293,7 +300,7 @@ func TestUpdatePaymentStatus_Success(t *testing.T) {
 }
 
 func TestUpdatePaymentStatus_InvalidTransition(t *testing.T) {
-	ta := setupApp()
+	ta := setupAppWithProviderBehavior(fakeProviderUnreachable)
 	merchant := createTestMerchantInApp(t, ta)
 	created := createTestPayment(t, ta, merchant.ID, "ORDER-STATUS-2")
 
@@ -329,7 +336,7 @@ func TestUpdatePaymentStatus_PaymentNotFound(t *testing.T) {
 }
 
 func TestGetPaymentHistory_Success(t *testing.T) {
-	ta := setupApp()
+	ta := setupAppWithProviderBehavior(fakeProviderUnreachable)
 	merchant := createTestMerchantInApp(t, ta)
 	created := createTestPayment(t, ta, merchant.ID, "ORDER-HISTORY-1")
 
@@ -347,9 +354,60 @@ func TestGetPaymentHistory_Success(t *testing.T) {
 
 	var entries []map[string]any
 	require.NoError(t, json.NewDecoder(histResp.Body).Decode(&entries))
-	require.Len(t, entries, 1)
-	require.Equal(t, "PENDING", entries[0]["previous_status"])
-	require.Equal(t, "APPROVED", entries[0]["new_status"])
+	// Create ya generó sus propias entradas (PENDING→PROCESSING→UNKNOWN,
+	// porque este test usa un proveedor inalcanzable a propósito); la
+	// ÚLTIMA es la que corresponde al PATCH manual de arriba.
+	last := entries[len(entries)-1]
+	require.Equal(t, "UNKNOWN", last["previous_status"])
+	require.Equal(t, "APPROVED", last["new_status"])
+}
+
+// TestReconcilePayment_ResolvesUnknown reproduce el escenario central del
+// riesgo documentado: el pago queda en UNKNOWN al crearse (el proveedor
+// no respondió), y luego, cuando el proveedor sí sabe qué pasó, un
+// POST .../reconcile lo resuelve — sin volver a cobrar nada.
+func TestReconcilePayment_ResolvesUnknown(t *testing.T) {
+	ta := setupAppWithProviderBehavior(fakeProviderUnreachable)
+	merchant := createTestMerchantInApp(t, ta)
+	created := createTestPayment(t, ta, merchant.ID, "ORDER-RECONCILE-1")
+	require.Equal(t, "UNKNOWN", created["status"])
+
+	// El proveedor, con el tiempo, sí sabe qué pasó.
+	ta.provider.behavior = fakeProviderApprove
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/payments/"+created["id"].(string)+"/reconcile", nil)
+	resp, err := ta.test(req)
+	require.NoError(t, err)
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+
+	var got map[string]any
+	require.NoError(t, json.NewDecoder(resp.Body).Decode(&got))
+	require.Equal(t, "APPROVED", got["status"])
+}
+
+func TestReconcilePayment_AlreadyResolved_NoOp(t *testing.T) {
+	ta := setupApp()
+	merchant := createTestMerchantInApp(t, ta)
+	created := createTestPayment(t, ta, merchant.ID, "ORDER-RECONCILE-2")
+	require.Equal(t, "APPROVED", created["status"])
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/payments/"+created["id"].(string)+"/reconcile", nil)
+	resp, err := ta.test(req)
+	require.NoError(t, err)
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+
+	var got map[string]any
+	require.NoError(t, json.NewDecoder(resp.Body).Decode(&got))
+	require.Equal(t, "APPROVED", got["status"], "un pago ya resuelto no debe cambiar al conciliar")
+}
+
+func TestReconcilePayment_NotFound(t *testing.T) {
+	ta := setupApp()
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/payments/id-que-no-existe/reconcile", nil)
+	resp, err := ta.test(req)
+	require.NoError(t, err)
+	require.Equal(t, http.StatusNotFound, resp.StatusCode)
 }
 
 func TestGetPaymentHistory_PaymentNotFound(t *testing.T) {
