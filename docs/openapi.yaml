@@ -169,7 +169,7 @@ paths:
           schema: { type: string, format: uuid }
         - name: status
           in: query
-          schema: { type: string, enum: [PENDING, APPROVED, REJECTED, CANCELLED] }
+          schema: { type: string, enum: [PENDING, PROCESSING, APPROVED, REJECTED, CANCELLED, UNKNOWN] }
         - name: payment_method
           in: query
           schema: { type: string, enum: [CARD, QR, NFC, TRANSFER] }
@@ -227,11 +227,13 @@ paths:
   /payments/{payment_id}/status:
     patch:
       tags: [payments]
-      summary: Cambiar el estado de un pago
+      summary: Cambiar el estado de un pago manualmente
       description: >
-        Solo se permiten las transiciones PENDING→APPROVED, PENDING→REJECTED
-        y PENDING→CANCELLED (ver README). Registra una entrada en el
-        historial con changed_by tomado del subject del JWT.
+        Transición manual, sin pasar por el proveedor: PENDING→APPROVED/
+        REJECTED/CANCELLED, o UNKNOWN→APPROVED/REJECTED para resolver a mano
+        una operación que quedó incierta (ver README, Sección 2). Registra
+        una entrada en el historial con changed_by tomado del subject del
+        JWT.
       parameters:
         - $ref: "#/components/parameters/PaymentId"
       requestBody:
@@ -259,6 +261,31 @@ paths:
             application/json:
               schema: { $ref: "#/components/schemas/Error" }
         "422": { $ref: "#/components/responses/ValidationError" }
+
+  /payments/{payment_id}/reconcile:
+    post:
+      tags: [payments]
+      summary: Conciliar un pago incierto con el proveedor real
+      description: >
+        Si el pago está en PROCESSING o UNKNOWN, le pregunta al proveedor
+        configurado (PaymentProvider.GetStatus) qué pasó de verdad y
+        resuelve a APPROVED/REJECTED si hay una respuesta clara — o lo deja
+        igual si el proveedor tampoco sabe todavía (no es un error). Si el
+        pago ya está resuelto (APPROVED/REJECTED/CANCELLED) o nunca llegó a
+        enviarse a un proveedor (PENDING), es un no-op: devuelve el pago tal
+        cual. Pensado para dispararse desde fuera — ej. el worker de Python
+        — sobre operaciones atascadas por demasiado tiempo (ver README,
+        Sección 2).
+      parameters:
+        - $ref: "#/components/parameters/PaymentId"
+      responses:
+        "200":
+          description: Pago conciliado (o devuelto sin cambios, si no aplicaba)
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Payment" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/PaymentNotFound" }
 
   /payments/{payment_id}/history:
     get:
@@ -363,7 +390,20 @@ components:
         amount: { type: number, example: 150000 }
         currency: { type: string, example: COP }
         payment_method: { type: string, enum: [CARD, QR, NFC, TRANSFER] }
-        status: { type: string, enum: [PENDING, APPROVED, REJECTED, CANCELLED] }
+        status: { type: string, enum: [PENDING, PROCESSING, APPROVED, REJECTED, CANCELLED, UNKNOWN] }
+        provider_reference:
+          type: string
+          format: uuid
+          nullable: true
+          description: >
+            Generada por MOVA (no por el proveedor) antes de intentar el
+            cobro, junto con la transición a PROCESSING. Null si el pago
+            nunca llegó a enviarse (sigue en PENDING).
+        provider_name:
+          type: string
+          nullable: true
+          example: simulated
+          description: Qué proveedor concreto procesó (o está procesando) este pago.
         created_at: { type: string, format: date-time }
         updated_at: { type: string, format: date-time }
 
@@ -372,8 +412,8 @@ components:
       properties:
         id: { type: string, format: uuid }
         payment_id: { type: string, format: uuid }
-        previous_status: { type: string, enum: [PENDING, APPROVED, REJECTED, CANCELLED] }
-        new_status: { type: string, enum: [PENDING, APPROVED, REJECTED, CANCELLED] }
+        previous_status: { type: string, enum: [PENDING, PROCESSING, APPROVED, REJECTED, CANCELLED, UNKNOWN] }
+        new_status: { type: string, enum: [PENDING, PROCESSING, APPROVED, REJECTED, CANCELLED, UNKNOWN] }
         reason: { type: string }
         changed_by: { type: string, example: mova-service }
         created_at: { type: string, format: date-time }
