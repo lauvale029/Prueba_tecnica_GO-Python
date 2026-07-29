@@ -45,14 +45,14 @@ def test_login_network_error_raises(client, requests_mock):
         client.login()
 
 
-def test_list_pending_payments_single_page(client, requests_mock):
+def test_list_payments_by_status_single_page(client, requests_mock):
     client._token = "a-jwt-token"
     requests_mock.get(
         f"{BASE_URL}/api/v1/payments",
         json={"data": [{"id": "p1"}, {"id": "p2"}], "page": 1, "limit": 100, "total": 2},
     )
 
-    payments = client.list_pending_payments()
+    payments = client.list_payments_by_status("PENDING")
 
     assert [p["id"] for p in payments] == ["p1", "p2"]
     sent_query = requests_mock.last_request.qs
@@ -61,7 +61,7 @@ def test_list_pending_payments_single_page(client, requests_mock):
     assert sent_query["limit"] == ["100"]
 
 
-def test_list_pending_payments_paginates_until_total(client, requests_mock):
+def test_list_payments_by_status_paginates_until_total(client, requests_mock):
     client._token = "a-jwt-token"
 
     responses = [
@@ -70,10 +70,23 @@ def test_list_pending_payments_paginates_until_total(client, requests_mock):
     ]
     requests_mock.get(f"{BASE_URL}/api/v1/payments", responses)
 
-    payments = client.list_pending_payments()
+    payments = client.list_payments_by_status("PENDING")
 
     assert len(payments) == 150
     assert requests_mock.call_count == 2
+
+
+def test_list_payments_by_status_sends_requested_status(client, requests_mock):
+    client._token = "a-jwt-token"
+    requests_mock.get(
+        f"{BASE_URL}/api/v1/payments",
+        json={"data": [], "page": 1, "limit": 100, "total": 0},
+    )
+
+    client.list_payments_by_status("UNKNOWN")
+
+    sent_query = requests_mock.last_request.qs
+    assert sent_query["status"] == ["unknown"]
 
 
 def test_reject_payment_success(client, requests_mock):

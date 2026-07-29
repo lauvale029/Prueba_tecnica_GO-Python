@@ -1,6 +1,5 @@
 from datetime import datetime, timedelta, timezone
 
-import pytest
 import requests
 
 from reconciliation_worker import filter_stale_payments, run
@@ -32,16 +31,22 @@ def test_filter_stale_payments_empty_input():
 
 class _FakeClient:
     """Doble de MovaAPIClient para probar run() sin HTTP real: cada test
-    controla exactamente qué pagos "existen" y cuáles fallan al rechazar.
+    controla exactamente qué pagos "existen" por estado y cuáles fallan al
+    rechazar/conciliar.
     """
 
-    def __init__(self, pending_payments, failing_ids=frozenset()):
-        self._pending_payments = pending_payments
+    def __init__(self, payments_by_status=None, failing_ids=frozenset(), reconcile_results=None):
+        self._payments_by_status = payments_by_status or {}
         self._failing_ids = failing_ids
+        # status que devuelve reconcile_payment para cada id; por defecto
+        # APPROVED (el proveedor sí resolvió), salvo que el test diga
+        # explícitamente que sigue incierto.
+        self._reconcile_results = reconcile_results or {}
         self.rejected_ids = []
+        self.reconciled_ids = []
 
-    def list_pending_payments(self):
-        return self._pending_payments
+    def list_payments_by_status(self, status):
+        return self._payments_by_status.get(status, [])
 
     def reject_payment(self, payment_id, reason):
         if payment_id in self._failing_ids:
@@ -49,38 +54,105 @@ class _FakeClient:
         self.rejected_ids.append(payment_id)
         return {"id": payment_id, "status": "REJECTED"}
 
+    def reconcile_payment(self, payment_id):
+        if payment_id in self._failing_ids:
+            raise requests.exceptions.ConnectionError("fallo simulado de red")
+        self.reconciled_ids.append(payment_id)
+        status = self._reconcile_results.get(payment_id, "APPROVED")
+        return {"id": payment_id, "status": status}
 
-def test_run_reconciles_all_stale_payments():
-    client = _FakeClient([_payment("p1", 60), _payment("p2", 90), _payment("recent", 5)])
 
-    found, reconciled, failed = run(client, threshold_minutes=30, now=NOW)
+def test_run_rejects_stale_pending_payments():
+    client = _FakeClient({"PENDING": [_payment("p1", 60), _payment("p2", 90), _payment("recent", 5)]})
 
-    assert found == 2
-    assert reconciled == 2
-    assert failed == 0
+    result = run(client, threshold_minutes=30, now=NOW)
+
+    assert result["rejected_found"] == 2
+    assert result["rejected"] == 2
+    assert result["reject_failed"] == 0
     assert client.rejected_ids == ["p1", "p2"]
 
 
-def test_run_counts_failures_without_stopping(capsys):
+def test_run_resolves_stale_processing_and_unknown_payments():
     client = _FakeClient(
-        [_payment("p1", 60), _payment("p2", 90), _payment("p3", 45)],
+        {
+            "PROCESSING": [_payment("proc-1", 60)],
+            "UNKNOWN": [_payment("unk-1", 90), _payment("unk-recent", 5)],
+        }
+    )
+
+    result = run(client, threshold_minutes=30, now=NOW)
+
+    assert result["reconciled_found"] == 2
+    assert result["resolved"] == 2
+    assert result["still_uncertain"] == 0
+    assert result["reconcile_failed"] == 0
+    assert set(client.reconciled_ids) == {"proc-1", "unk-1"}
+
+
+def test_run_counts_still_uncertain_separately_from_resolved():
+    # El proveedor respondió (sin error), pero sigue sin saber qué pasó de
+    # verdad — reconcile_payment devuelve el mismo estado incierto, sin
+    # cambiar nada. No es una falla: solo hay que reintentar más tarde.
+    client = _FakeClient(
+        {"PROCESSING": [_payment("proc-1", 60)], "UNKNOWN": [_payment("unk-1", 90)]},
+        reconcile_results={"proc-1": "UNKNOWN", "unk-1": "UNKNOWN"},
+    )
+
+    result = run(client, threshold_minutes=30, now=NOW)
+
+    assert result["reconciled_found"] == 2
+    assert result["resolved"] == 0
+    assert result["still_uncertain"] == 2
+    assert result["reconcile_failed"] == 0
+
+
+def test_run_counts_reject_failures_without_stopping(capsys):
+    client = _FakeClient(
+        {"PENDING": [_payment("p1", 60), _payment("p2", 90), _payment("p3", 45)]},
         failing_ids={"p2"},
     )
 
-    found, reconciled, failed = run(client, threshold_minutes=30, now=NOW)
+    result = run(client, threshold_minutes=30, now=NOW)
 
-    assert found == 3
-    assert reconciled == 2
-    assert failed == 1
+    assert result["rejected_found"] == 3
+    assert result["rejected"] == 2
+    assert result["reject_failed"] == 1
     assert client.rejected_ids == ["p1", "p3"]
 
     captured = capsys.readouterr()
     assert "p2" in captured.out
 
 
-def test_run_no_stale_payments():
-    client = _FakeClient([_payment("recent", 5)])
+def test_run_counts_reconcile_failures_without_stopping(capsys):
+    client = _FakeClient(
+        {"PROCESSING": [_payment("p1", 60), _payment("p2", 90)]},
+        failing_ids={"p2"},
+    )
 
-    found, reconciled, failed = run(client, threshold_minutes=30, now=NOW)
+    result = run(client, threshold_minutes=30, now=NOW)
 
-    assert (found, reconciled, failed) == (0, 0, 0)
+    assert result["reconciled_found"] == 2
+    assert result["resolved"] == 1
+    assert result["still_uncertain"] == 0
+    assert result["reconcile_failed"] == 1
+    assert client.reconciled_ids == ["p1"]
+
+    captured = capsys.readouterr()
+    assert "p2" in captured.out
+
+
+def test_run_nothing_stale():
+    client = _FakeClient({"PENDING": [_payment("recent", 5)]})
+
+    result = run(client, threshold_minutes=30, now=NOW)
+
+    assert result == {
+        "rejected_found": 0,
+        "rejected": 0,
+        "reject_failed": 0,
+        "reconciled_found": 0,
+        "resolved": 0,
+        "still_uncertain": 0,
+        "reconcile_failed": 0,
+    }
