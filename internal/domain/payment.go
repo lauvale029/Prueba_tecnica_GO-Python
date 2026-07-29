@@ -10,15 +10,22 @@ import (
 type PaymentStatus string
 
 const (
-	PaymentStatusPending   PaymentStatus = "PENDING"
-	PaymentStatusApproved  PaymentStatus = "APPROVED"
-	PaymentStatusRejected  PaymentStatus = "REJECTED"
-	PaymentStatusCancelled PaymentStatus = "CANCELLED"
+	PaymentStatusPending    PaymentStatus = "PENDING"
+	PaymentStatusProcessing PaymentStatus = "PROCESSING"
+	PaymentStatusApproved   PaymentStatus = "APPROVED"
+	PaymentStatusRejected   PaymentStatus = "REJECTED"
+	PaymentStatusCancelled  PaymentStatus = "CANCELLED"
+	// PaymentStatusUnknown representa una operación que se envió a un
+	// proveedor externo pero cuyo resultado no se pudo confirmar (caída de
+	// red, timeout): no es un estado terminal, exige conciliación con el
+	// proveedor para resolverse a APPROVED o REJECTED.
+	PaymentStatusUnknown PaymentStatus = "UNKNOWN"
 )
 
 func (s PaymentStatus) IsValid() bool {
 	switch s {
-	case PaymentStatusPending, PaymentStatusApproved, PaymentStatusRejected, PaymentStatusCancelled:
+	case PaymentStatusPending, PaymentStatusProcessing, PaymentStatusApproved,
+		PaymentStatusRejected, PaymentStatusCancelled, PaymentStatusUnknown:
 		return true
 	default:
 		return false
@@ -43,11 +50,35 @@ func (m PaymentMethod) IsValid() bool {
 	}
 }
 
-// allowedTransitions codifica las únicas transiciones de estado válidas:
-// un pago sale de PENDING una sola vez, hacia cualquier estado terminal,
-// y los estados terminales nunca vuelven a transicionar.
+// allowedTransitions codifica las únicas transiciones de estado válidas.
+//
+// PENDING conserva su salida directa a APPROVED/REJECTED/CANCELLED (el
+// cambio manual vía PATCH /payments/{id}/status, sin pasar por ningún
+// proveedor externo). PROCESSING y UNKNOWN son el camino que sigue el
+// flujo automático de creación cuando sí hay un proveedor externo de por
+// medio: PENDING → PROCESSING se persiste ANTES de llamar al proveedor
+// (para que una caída a mitad de la llamada deje evidencia de que la
+// operación quedó en camino, no perdida); desde ahí, una respuesta clara
+// del proveedor mueve a APPROVED/REJECTED, y la ausencia de respuesta
+// mueve a UNKNOWN. UNKNOWN solo se resuelve conciliando con el proveedor
+// (nunca con una cancelación manual — cancelar algo que en realidad sí
+// se cobró falsearía el registro).
 var allowedTransitions = map[PaymentStatus][]PaymentStatus{
-	PaymentStatusPending: {PaymentStatusApproved, PaymentStatusRejected, PaymentStatusCancelled},
+	PaymentStatusPending: {
+		PaymentStatusProcessing,
+		PaymentStatusApproved,
+		PaymentStatusRejected,
+		PaymentStatusCancelled,
+	},
+	PaymentStatusProcessing: {
+		PaymentStatusApproved,
+		PaymentStatusRejected,
+		PaymentStatusUnknown,
+	},
+	PaymentStatusUnknown: {
+		PaymentStatusApproved,
+		PaymentStatusRejected,
+	},
 }
 
 func CanTransition(from, to PaymentStatus) bool {
@@ -60,15 +91,24 @@ func CanTransition(from, to PaymentStatus) bool {
 }
 
 type Payment struct {
-	ID                 string
-	MerchantID         string
-	ExternalReference  string
-	Amount             Money
-	PaymentMethod      PaymentMethod
-	Status             PaymentStatus
-	IdempotencyKey     string
-	CreatedAt          time.Time
-	UpdatedAt          time.Time
+	ID                string
+	MerchantID        string
+	ExternalReference string
+	Amount            Money
+	PaymentMethod     PaymentMethod
+	Status            PaymentStatus
+	IdempotencyKey    string
+	// ProviderReference es el identificador que asigna el proveedor
+	// externo (ej. Nequi) a la operación de cobro; nil hasta que el pago
+	// se envía al proveedor (ver PaymentProvider en application/ports.go).
+	ProviderReference *string
+	// ProviderName identifica CUÁL proveedor externo procesó el pago (ej.
+	// "nequi", "bre-b", "simulated") — permite soportar más de un
+	// proveedor sin ambigüedad sobre a cuál conciliar. También nil hasta
+	// que el pago se envía a un proveedor.
+	ProviderName *string
+	CreatedAt         time.Time
+	UpdatedAt         time.Time
 }
 
 // NewPayment valida los campos exigidos por las reglas de negocio y crea

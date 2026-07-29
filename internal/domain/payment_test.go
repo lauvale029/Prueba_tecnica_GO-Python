@@ -53,12 +53,27 @@ func TestCanTransition(t *testing.T) {
 		{domain.PaymentStatusPending, domain.PaymentStatusApproved, true},
 		{domain.PaymentStatusPending, domain.PaymentStatusRejected, true},
 		{domain.PaymentStatusPending, domain.PaymentStatusCancelled, true},
+		{domain.PaymentStatusPending, domain.PaymentStatusProcessing, true},
 		{domain.PaymentStatusApproved, domain.PaymentStatusPending, false},
 		{domain.PaymentStatusApproved, domain.PaymentStatusRejected, false},
 		{domain.PaymentStatusApproved, domain.PaymentStatusCancelled, false},
 		{domain.PaymentStatusRejected, domain.PaymentStatusApproved, false},
 		{domain.PaymentStatusRejected, domain.PaymentStatusPending, false},
 		{domain.PaymentStatusCancelled, domain.PaymentStatusPending, false},
+		// PROCESSING: puede resolverse a un estado terminal, o quedar
+		// incierto si el proveedor no respondió.
+		{domain.PaymentStatusProcessing, domain.PaymentStatusApproved, true},
+		{domain.PaymentStatusProcessing, domain.PaymentStatusRejected, true},
+		{domain.PaymentStatusProcessing, domain.PaymentStatusUnknown, true},
+		{domain.PaymentStatusProcessing, domain.PaymentStatusPending, false},
+		{domain.PaymentStatusProcessing, domain.PaymentStatusCancelled, false},
+		// UNKNOWN: solo se resuelve conciliando con el proveedor, nunca
+		// cancelándolo a mano ni volviendo a un estado "en camino".
+		{domain.PaymentStatusUnknown, domain.PaymentStatusApproved, true},
+		{domain.PaymentStatusUnknown, domain.PaymentStatusRejected, true},
+		{domain.PaymentStatusUnknown, domain.PaymentStatusCancelled, false},
+		{domain.PaymentStatusUnknown, domain.PaymentStatusProcessing, false},
+		{domain.PaymentStatusUnknown, domain.PaymentStatusPending, false},
 	}
 
 	for _, tt := range tests {
@@ -90,6 +105,47 @@ func TestPayment_ChangeStatus_CannotReturnToPending(t *testing.T) {
 	require.NoError(t, p.ChangeStatus(domain.PaymentStatusCancelled))
 
 	err := p.ChangeStatus(domain.PaymentStatusPending)
+
+	require.ErrorIs(t, err, domain.ErrInvalidStatusTransition)
+}
+
+func TestPayment_ChangeStatus_ProcessingToApproved(t *testing.T) {
+	p := newValidPayment(t)
+	require.NoError(t, p.ChangeStatus(domain.PaymentStatusProcessing))
+
+	err := p.ChangeStatus(domain.PaymentStatusApproved)
+
+	require.NoError(t, err)
+	require.Equal(t, domain.PaymentStatusApproved, p.Status)
+}
+
+func TestPayment_ChangeStatus_ProcessingToUnknown(t *testing.T) {
+	p := newValidPayment(t)
+	require.NoError(t, p.ChangeStatus(domain.PaymentStatusProcessing))
+
+	err := p.ChangeStatus(domain.PaymentStatusUnknown)
+
+	require.NoError(t, err)
+	require.Equal(t, domain.PaymentStatusUnknown, p.Status)
+}
+
+func TestPayment_ChangeStatus_UnknownResolvesToApproved(t *testing.T) {
+	p := newValidPayment(t)
+	require.NoError(t, p.ChangeStatus(domain.PaymentStatusProcessing))
+	require.NoError(t, p.ChangeStatus(domain.PaymentStatusUnknown))
+
+	err := p.ChangeStatus(domain.PaymentStatusApproved)
+
+	require.NoError(t, err)
+	require.Equal(t, domain.PaymentStatusApproved, p.Status)
+}
+
+func TestPayment_ChangeStatus_UnknownCannotBeCancelledManually(t *testing.T) {
+	p := newValidPayment(t)
+	require.NoError(t, p.ChangeStatus(domain.PaymentStatusProcessing))
+	require.NoError(t, p.ChangeStatus(domain.PaymentStatusUnknown))
+
+	err := p.ChangeStatus(domain.PaymentStatusCancelled)
 
 	require.ErrorIs(t, err, domain.ErrInvalidStatusTransition)
 }
